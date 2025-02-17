@@ -3,15 +3,23 @@ name: Docs
 on:
   pull_request:
     types:
-      - unlabeled # if GitHub Actions stuck, add and remove "no ci" label to force rebuild
+      - unlabeled # if GitHub Actions stuck, add and remove "not ready" label to force rebuild
       - opened
       - reopened
       - synchronize
   push:
     branches:
       - main
+      - main-*
+      - releases/*
   schedule:
-    - cron: "42 3 * * *" # after Integration workflow
+    - cron: "12 0 * * *"
+
+# Do not run this workflow in parallel for any PR change or branch push
+# to prevent concurrent deployments to GitHub Pages.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   GOPATH: /home/runner/go
@@ -19,30 +27,42 @@ env:
   GOLANGCI_LINT_CACHE: /home/runner/go/cache/lint
   GOMODCACHE: /home/runner/go/mod
   GOPROXY: https://proxy.golang.org
+  GOTOOLCHAIN: local
 
 jobs:
   build:
     name: Build docs
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
-    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'no ci')
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'not ready')
 
     steps:
+      # TODO https://github.com/FerretDB/github-actions/issues/211
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           lfs: true
 
+      # This step will fail with "Error: Resource not accessible by integration"
+      # while trying to add label and comment to PR, that is not possible for PRs from forks.
+      # See https://github.com/ppremk/lfs-warning/issues/147.
+      # But the real issue will be right above that message: a list of files that should be added using Git LFS.
       - name: Check LFS status
-        if: false # TODO https://github.com/ActionsDesk/lfs-warning/issues/147
-        uses: actionsdesk/lfs-warning@v3.2
+        uses: ppremk/lfs-warning@v3.3
         with:
-          filesizelimit: 1MB
+          filesizelimit: 102400b
+          labelName: use-git-lfs
+          exclusionPatterns: |
+            **/*.go
+            **/*.js
+            **/*.md
+            **/go.sum
 
       - name: Setup Go
         uses: FerretDB/github-actions/setup-go@main
         with:
-          cache-key: build
+          cache-key: docs
 
       - name: Install Task
         run: go generate -x
@@ -51,22 +71,29 @@ jobs:
       - name: Build tools
         run: bin/task env-pull
 
+      - name: Create directory
+        run: mkdir -p tmp/githubcache
+
       - name: Build docs
         run: bin/task docs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # for checkdocs
 
       - name: Archive docs
-        run: |
-          tar --directory website/build \
-            --file docs.tar \
-            --create \
-            --verbose \
-            .
+        run: >
+          tar --directory website/build
+          --file tmp/docs.tar
+          --create
+          --verbose
+          .
 
+      # it has to be exactly "docs.tar" for actions/deploy-pages below
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: docs
-          path: docs.tar
+          path: tmp/docs.tar
+          retention-days: 1
           if-no-files-found: error
 
       - name: Check dirty
@@ -74,11 +101,12 @@ jobs:
           git status
           git diff --exit-code
 
-  pages:
-    name: Deploy to Pages
-    runs-on: ubuntu-20.04
+  github:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
-    # deploy only on push to main; exclude pull_request and schedule
+    # exclude pull_request and schedule
     needs: build
     if: github.event_name == 'push'
 
@@ -87,13 +115,13 @@ jobs:
       id-token: write
 
     environment:
-      name: pages
+      name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
 
     steps:
       - name: Deploy to GitHub Pages
         id: deploy
-        uses: actions/deploy-pages@v1
+        uses: actions/deploy-pages@v4
         with:
           artifact_name: docs
           timeout: 300000 # 5*60*1000 milliseconds

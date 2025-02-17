@@ -15,22 +15,23 @@
 package integration
 
 import (
-	"errors"
 	"testing"
 
-	"github.com/AlekSi/pointer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/FerretDB/FerretDB/integration/setup"
+	"github.com/FerretDB/FerretDB/v2/integration/setup"
 )
 
 type insertCompatTestCase struct {
-	insert     bson.D                   // required
-	resultType compatTestCaseResultType // defaults to nonEmptyResult
+	insert           []any // required, slice of bson.D to be insert
+	ordered          bool  // defaults to false
+	failsForFerretDB string
+	resultType       compatTestCaseResultType // defaults to nonEmptyResult
 }
 
 // testInsertCompat tests insert compatibility test cases.
@@ -38,75 +39,132 @@ func testInsertCompat(t *testing.T, testCases map[string]insertCompatTestCase) {
 	t.Helper()
 
 	for name, tc := range testCases {
-		name, tc := name, tc
 		t.Run(name, func(t *testing.T) {
 			t.Helper()
-
 			t.Parallel()
 
-			ctx, targetCollections, compatCollections := setup.SetupCompat(t)
+			t.Run("InsertOne", func(t *testing.T) {
+				t.Helper()
+				t.Parallel()
 
-			insert := tc.insert
-			require.NotNil(t, insert, "insert should be set")
+				ctx, targetCollections, compatCollections := setup.SetupCompat(t)
 
-			var nonEmptyResults bool
-			for i := range targetCollections {
-				targetCollection := targetCollections[i]
-				compatCollection := compatCollections[i]
-				t.Run(targetCollection.Name(), func(t *testing.T) {
-					t.Helper()
+				insert := tc.insert
+				require.NotEmpty(t, insert, "insert should be set")
 
-					targetInsertRes, targetErr := targetCollection.InsertOne(ctx, insert)
-					compatInsertRes, compatErr := compatCollection.InsertOne(ctx, insert)
+				for i := range targetCollections {
+					targetCollection := targetCollections[i]
+					compatCollection := compatCollections[i]
 
-					if targetErr != nil {
-						t.Logf("Target error: %v", targetErr)
-						targetErr = UnsetRaw(t, targetErr)
-						compatErr = UnsetRaw(t, compatErr)
+					t.Run(targetCollection.Name(), func(tt *testing.T) {
+						tt.Helper()
 
-						// Skip inserts that could not be performed due to Tigris schema validation.
-						var e mongo.CommandError
-						if errors.As(targetErr, &e) && e.Name == "DocumentValidationFailure" {
-							if e.HasErrorCodeWithMessage(121, "json schema validation failed for field") {
-								setup.SkipForTigrisWithReason(t, targetErr.Error())
-							}
+						var t testing.TB = tt
+						if tc.failsForFerretDB != "" {
+							t = setup.FailsForFerretDB(tt, tc.failsForFerretDB)
 						}
 
-						assert.Equal(t, compatErr, targetErr)
-					} else {
+						for _, doc := range insert {
+							targetInsertRes, targetErr := targetCollection.InsertOne(ctx, doc)
+							compatInsertRes, compatErr := compatCollection.InsertOne(ctx, doc)
+
+							if targetErr != nil {
+								switch targetErr := targetErr.(type) { //nolint:errorlint // don't inspect error chain
+								case mongo.WriteException:
+									AssertMatchesWriteError(t, compatErr, targetErr)
+								case mongo.BulkWriteException:
+									AssertMatchesBulkException(t, compatErr, targetErr)
+								default:
+									assert.Equal(t, compatErr, targetErr)
+								}
+
+								continue
+							}
+
+							require.NoError(t, compatErr, "compat error; target returned no error")
+							require.Equal(t, compatInsertRes, targetInsertRes)
+						}
+
+						targetFindRes := FindAll(t, ctx, targetCollection)
+						compatFindRes := FindAll(t, ctx, compatCollection)
+
+						require.Equal(t, len(compatFindRes), len(targetFindRes))
+
+						for i := range compatFindRes {
+							AssertEqualDocuments(t, compatFindRes[i], targetFindRes[i])
+						}
+					})
+				}
+			})
+
+			t.Run("InsertMany", func(t *testing.T) {
+				t.Helper()
+				t.Parallel()
+
+				ctx, targetCollections, compatCollections := setup.SetupCompat(t)
+
+				insert := tc.insert
+				require.NotEmpty(t, insert, "insert should be set")
+
+				var nonEmptyResults bool
+				for i := range targetCollections {
+					targetCollection := targetCollections[i]
+					compatCollection := compatCollections[i]
+
+					t.Run(targetCollection.Name(), func(tt *testing.T) {
+						tt.Helper()
+
+						var t testing.TB = tt
+						if tc.failsForFerretDB != "" {
+							t = setup.FailsForFerretDB(tt, tc.failsForFerretDB)
+						}
+
+						opts := options.InsertMany().SetOrdered(tc.ordered)
+						targetInsertRes, targetErr := targetCollection.InsertMany(ctx, insert, opts)
+						compatInsertRes, compatErr := compatCollection.InsertMany(ctx, insert, opts)
+
+						// If the result contains inserted ids, we consider the result non-empty.
+						if (compatInsertRes != nil && len(compatInsertRes.InsertedIDs) > 0) ||
+							(targetInsertRes != nil && len(targetInsertRes.InsertedIDs) > 0) {
+							nonEmptyResults = true
+						}
+
+						if targetErr != nil {
+							switch targetErr := targetErr.(type) { //nolint:errorlint // don't inspect error chain
+							case mongo.WriteException:
+								AssertMatchesWriteError(t, compatErr, targetErr)
+							case mongo.BulkWriteException:
+								AssertMatchesBulkException(t, compatErr, targetErr)
+							default:
+								assert.Equal(t, compatErr, targetErr)
+							}
+
+							return
+						}
+
 						require.NoError(t, compatErr, "compat error; target returned no error")
-					}
+						require.Equal(t, compatInsertRes, targetInsertRes)
 
-					targetID, _ := pointer.Get(targetInsertRes).InsertedID.(primitive.ObjectID)
-					compatID, _ := pointer.Get(compatInsertRes).InsertedID.(primitive.ObjectID)
+						targetFindRes := FindAll(t, ctx, targetCollection)
+						compatFindRes := FindAll(t, ctx, compatCollection)
 
-					if !(targetID.IsZero() && compatID.IsZero()) {
-						nonEmptyResults = true
-					}
+						require.Equal(t, len(compatFindRes), len(targetFindRes))
 
-					var targetFindRes, compatFindRes bson.D
-					targetCursor, err := targetCollection.Find(ctx, bson.D{{}})
-					require.NoError(t, err)
-					defer targetCursor.Close(ctx)
-					targetCursor.Decode(&targetFindRes)
+						for i := range compatFindRes {
+							AssertEqualDocuments(t, compatFindRes[i], targetFindRes[i])
+						}
+					})
+				}
 
-					compatCursor, err := compatCollection.Find(ctx, bson.D{{}})
-					require.NoError(t, err)
-					defer compatCursor.Close(ctx)
-					compatCursor.Decode(&targetFindRes)
-
-					AssertEqualDocuments(t, compatFindRes, targetFindRes)
-				})
-			}
-
-			switch tc.resultType {
-			case nonEmptyResult:
-				assert.True(t, nonEmptyResults, "expected non-empty results")
-			case emptyResult:
-				assert.False(t, nonEmptyResults, "expected empty results")
-			default:
-				t.Fatalf("unknown result type %v", tc.resultType)
-			}
+				switch tc.resultType {
+				case nonEmptyResult:
+					assert.True(t, nonEmptyResults, "expected non-empty results")
+				case emptyResult:
+					assert.False(t, nonEmptyResults, "expected empty results")
+				default:
+					t.Fatalf("unknown result type %v", tc.resultType)
+				}
+			})
 		})
 	}
 }
@@ -115,16 +173,82 @@ func TestInsertCompat(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]insertCompatTestCase{
-		"InsertEmptyDocument": {
-			insert: bson.D{},
+		"Normal": {
+			insert: []any{bson.D{{"_id", int32(42)}}},
 		},
-		"InsertIDArray": {
-			insert:     bson.D{{"_id", bson.A{"foo", "bar"}}},
-			resultType: emptyResult,
+
+		"IDArray": {
+			insert:           []any{bson.D{{"_id", bson.A{"foo", "bar"}}}},
+			resultType:       emptyResult,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
 		},
-		"InsertIDRegex": {
-			insert:     bson.D{{"_id", "^regex$"}},
-			resultType: emptyResult,
+		"IDRegex": {
+			insert:           []any{bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}}},
+			resultType:       emptyResult,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
+		},
+
+		"OrderedAllErrors": {
+			insert: []any{
+				bson.D{{"_id", bson.A{"foo", "bar"}}},
+				bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}},
+			},
+			ordered:          true,
+			resultType:       emptyResult,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
+		},
+		"UnorderedAllErrors": {
+			insert: []any{
+				bson.D{{"_id", bson.A{"foo", "bar"}}},
+				bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}},
+			},
+			ordered:          false,
+			resultType:       emptyResult,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
+		},
+
+		"OrderedOneError": {
+			insert: []any{
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}},
+				bson.D{{"_id", "2"}},
+			},
+			ordered:          true,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
+		},
+		"UnorderedTwoErrors": {
+			insert: []any{
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}},
+				bson.D{{"_id", "2"}},
+			},
+			ordered:          false,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
+		},
+		"OrderedThreeErrors": {
+			insert: []any{
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}},
+				bson.D{{"_id", "2"}},
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", "3"}},
+				bson.D{{"_id", "4"}, {"_id", "4"}},
+			},
+			ordered:          true,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
+		},
+		"UnorderedThreeErrors": {
+			insert: []any{
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", primitive.Regex{Pattern: "^regex$", Options: "i"}}},
+				bson.D{{"_id", "2"}},
+				bson.D{{"_id", "1"}},
+				bson.D{{"_id", "3"}},
+				bson.D{{"_id", "4"}, {"_id", "4"}},
+			},
+			ordered:          false,
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/295",
 		},
 	}
 

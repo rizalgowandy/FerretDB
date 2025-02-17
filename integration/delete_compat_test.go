@@ -24,7 +24,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/FerretDB/FerretDB/integration/setup"
+	"github.com/FerretDB/FerretDB/v2/integration/setup"
 )
 
 // deleteCompatTestCase describes delete compatibility test case.
@@ -32,18 +32,12 @@ type deleteCompatTestCase struct {
 	filters    []bson.D                 // required
 	ordered    bool                     // defaults to false
 	resultType compatTestCaseResultType // defaults to nonEmptyResult
-	skip       string                   // skips test if non-empty
 }
 
 func TestDeleteCompat(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]deleteCompatTestCase{
-		"Empty": {
-			filters:    []bson.D{},
-			resultType: emptyResult,
-		},
-
 		"One": {
 			filters: []bson.D{
 				{{"v", int32(42)}},
@@ -136,13 +130,8 @@ func testDeleteCompat(t *testing.T, testCases map[string]deleteCompatTestCase) {
 	t.Helper()
 
 	for name, tc := range testCases {
-		name, tc := name, tc
 		t.Run(name, func(t *testing.T) {
 			t.Helper()
-
-			if tc.skip != "" {
-				t.Skip(tc.skip)
-			}
 
 			t.Parallel()
 
@@ -171,10 +160,11 @@ func testDeleteCompat(t *testing.T, testCases map[string]deleteCompatTestCase) {
 
 					if targetErr != nil {
 						t.Logf("Target error: %v", targetErr)
-						targetErr = UnsetRaw(t, targetErr)
-						compatErr = UnsetRaw(t, compatErr)
-						assert.Equal(t, compatErr, targetErr)
-					} else {
+						t.Logf("Compat error: %v", compatErr)
+
+						// error messages are intentionally not compared
+						AssertMatchesBulkException(t, compatErr, targetErr)
+					} else { // we have to check the results in case of error because some documents may be deleted
 						require.NoError(t, compatErr, "compat error; target returned no error")
 					}
 
@@ -182,6 +172,8 @@ func testDeleteCompat(t *testing.T, testCases map[string]deleteCompatTestCase) {
 						nonEmptyResults = true
 					}
 
+					t.Logf("Compat (expected) result: %v", compatRes)
+					t.Logf("Target (actual)   result: %v", targetRes)
 					assert.Equal(t, compatRes, targetRes)
 
 					targetDocs := FindAll(t, ctx, targetCollection)

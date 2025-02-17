@@ -1,0 +1,184 @@
+---
+# New or experimental linters that should pass (or be reconfigured)
+# for new integration code (compared to `origin/main`).
+
+run:
+  timeout: 3m
+
+# ../bin/golangci-lint linters -c .golangci-new.yml
+linters-settings:
+  asasalint:
+    exclude:
+      - ^lazyerrors\.Errorf$
+    use-builtin-exclusions: true
+    ignore-test: false
+  copyloopvar:
+    check-alias: true
+  errcheck:
+    check-type-assertions: false
+    check-blank: false
+    disable-default-exclusions: false
+    exclude-functions:
+      - (*go.mongodb.org/mongo-driver/mongo.Cursor).Close
+  errorlint:
+    # see caveats at https://github.com/polyfloyd/go-errorlint#fmterrorf-wrapping-verb
+    errorf: false
+    asserts: true
+    comparison: true
+  govet:
+    enable-all: true
+    settings:
+      shadow:
+        strict: true
+  revive:
+    ignore-generated-header: true
+    severity: warning
+    # TODO enable-all-rules: true https://github.com/FerretDB/FerretDB/issues/2748
+    rules:
+      # https://github.com/mgechev/revive/blob/master/RULES_DESCRIPTIONS.md
+      - name: exported
+        arguments: [checkPrivateReceivers, disableStutteringCheck]
+      - name: package-comments
+  staticcheck:
+    checks: ["all"]
+  wsl:
+    # https://github.com/bombsimon/wsl/blob/master/doc/configuration.md
+    strict-append: false
+    allow-assign-and-call: true
+    allow-assign-and-anything: true
+    allow-multiline-assign: true
+    allow-separated-leading-comment: true
+    force-case-trailing-whitespace: 0
+    allow-cuddle-declarations: true
+    allow-case-trailing-whitespace: true
+    allow-trailing-comment: true
+    enforce-err-cuddling: false
+    force-short-decl-cuddling: false
+
+linters:
+  enable-all: true
+  disable:
+    # checked by the other configuration
+    - asciicheck
+    - depguard
+    - exhaustive
+    - gci
+    - gochecksumtype
+    - goconst
+    - godot
+    - godox
+    - goheader
+    - goimports
+    - gomodguard
+    - gosimple
+    - importas
+    - ineffassign
+    - lll
+    - misspell
+    - nolintlint
+    - sloglint
+    - tagalign
+    - unparam
+    - unused
+    - whitespace
+
+    # TODO https://github.com/FerretDB/FerretDB/issues/2748
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - containedctx
+    - contextcheck
+    - cyclop
+    - decorder
+    - dogsled
+    - dupl
+    - dupword
+    - durationcheck
+    - err113
+    - errchkjson
+    - errname
+    - exhaustruct
+    - fatcontext
+    - forbidigo
+    - forcetypeassert
+    - funlen
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - gochecknoglobals
+    - gochecknoinits
+    - gocognit
+    - gocritic
+    - gocyclo
+    - gofmt
+    - gofumpt
+    - gomoddirectives
+    - goprintffuncname
+    - gosec
+    - gosmopolitan
+    - grouper
+    - iface
+    - inamedparam
+    - interfacebloat
+    - intrange
+    - ireturn
+    - loggercheck
+    - maintidx
+    - makezero
+    - mirror
+    - mnd
+    - musttag
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnil
+    - noctx
+    - nonamedreturns
+    - nosprintfhostport
+    - paralleltest
+    - perfsprint
+    - prealloc
+    - predeclared
+    - promlinter
+    - protogetter
+    - reassign
+    - recvcheck
+    - rowserrcheck
+    - sloglint
+    - spancheck
+    - sqlclosecheck
+    - stylecheck
+    - tagliatelle
+    - tenv
+    - testableexamples
+    - testifylint
+    - thelper
+    - tparallel
+    - typecheck
+    - unconvert
+    - usestdlibvars
+    - varnamelen
+    - wastedassign
+    - wrapcheck
+    - zerologlint
+
+    - nlreturn # too annoying
+    - testpackage # we test internals
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+  new-from-rev: origin/main
+  # whole-files: true
+
+  exclude-use-default: false
+  exclude-rules:
+    # that's a valid usage of bson.D / bson.E
+    - linters: [govet]
+      text: "composites: go.mongodb.org/mongo-driver/bson/primitive.E struct literal uses unkeyed fields"
+    - linters: [govet]
+      text: "composites: go.mongodb.org/mongo-driver/bson.E struct literal uses unkeyed fields"
+
+    # sometimes that's the best we can do
+    - linters: [staticcheck]
+      text: "SA1019: doc.Map is deprecated"

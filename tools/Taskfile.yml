@@ -3,15 +3,30 @@
 version: 3
 
 vars:
-  RACEFLAG: -race={{ne OS "windows"}}
+  PACKAGES: ./checkcomments/... ./checkdocs/... ./checkswitch/... ./definedockertag/... ./generatechangelog/... ./github/...
+  RACE_FLAG: -race={{and (ne OS "windows") (ne ARCH "arm") (ne ARCH "riscv64")}}
 
 tasks:
-  lint-go-consistent:
+  tools-test-short:
+    desc: "Run short unit tests (with caching)"
     cmds:
-      - ../bin/go-consistent{{exeExt}} -v -pedantic ./checkswitch/...
-    sources:
-      - "**/*.go"
+      - ../bin/envtool{{exeExt}} shell rmdir ../tmp/githubcache
+      - ../bin/envtool{{exeExt}} shell mkdir ../tmp/githubcache
+      - go test -short {{.RACE_FLAG}} -shuffle=on -coverprofile=cover.txt {{.PACKAGES}}
 
-  test-unit-short:
+  tools-test:
+    desc: "Run all unit tests"
     cmds:
-      - go test -short {{.RACEFLAG}} -shuffle=on -coverprofile=cover.txt -coverpkg=./... ./checkswitch/...
+      - ../bin/envtool{{exeExt}} shell rmdir ../tmp/githubcache
+      - ../bin/envtool{{exeExt}} shell mkdir ../tmp/githubcache
+      - go test -count=1 {{.RACE_FLAG}} -shuffle=on -coverprofile=cover.txt {{.PACKAGES}}
+
+  lint:
+    desc: "Run linters"
+    cmds:
+      - ../bin/golangci-lint{{exeExt}} run --config=../.golangci.yml {{.PACKAGES}}
+      - ../bin/golangci-lint{{exeExt}} run --config=../.golangci-new.yml {{.PACKAGES}}
+      - ../bin/go-consistent{{exeExt}} -pedantic {{.PACKAGES}}
+
+      - go vet -vettool=../bin/checkswitch{{exeExt}} {{.PACKAGES}}
+      - go vet -vettool=../bin/checkcomments{{exeExt}} {{.PACKAGES}}

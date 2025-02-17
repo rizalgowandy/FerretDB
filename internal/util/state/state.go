@@ -20,8 +20,6 @@ import (
 
 	"github.com/AlekSi/pointer"
 	"github.com/google/uuid"
-
-	"github.com/FerretDB/FerretDB/internal/util/must"
 )
 
 // State represents FerretDB process state.
@@ -29,16 +27,53 @@ type State struct {
 	UUID      string `json:"uuid"`
 	Telemetry *bool  `json:"telemetry,omitempty"` // nil for undecided
 
-	// never persisted
-	Start          time.Time `json:"-"`
-	LatestVersion  string    `json:"-"`
-	HandlerVersion string    `json:"-"`
+	// all following fields are never persisted
+
+	TelemetryLocked bool      `json:"-"`
+	Start           time.Time `json:"-"`
+
+	// may be empty if FerretDB did not connect to PostgreSQL yet
+	PostgreSQLVersion string `json:"-"`
+	DocumentDBVersion string `json:"-"`
+
+	// as reported by beacon, if known
+	LatestVersion   string `json:"-"`
+	UpdateInfo      string `json:"-"`
+	UpdateAvailable bool   `json:"-"`
+}
+
+// TelemetryString returns "enabled", "disabled" or "undecided".
+func (s *State) TelemetryString() string {
+	if s.Telemetry == nil {
+		return "undecided"
+	}
+
+	if *s.Telemetry {
+		return "enabled"
+	}
+
+	return "disabled"
+}
+
+// DisableTelemetry disables telemetry.
+//
+// It also resets other telemetry fields to avoid stale values when telemetry is re-enabled.
+func (s *State) DisableTelemetry() {
+	s.Telemetry = pointer.ToBool(false)
+	s.LatestVersion = ""
+	s.UpdateInfo = ""
+	s.UpdateAvailable = false
+}
+
+// EnableTelemetry enables telemetry.
+func (s *State) EnableTelemetry() {
+	s.Telemetry = pointer.ToBool(true)
 }
 
 // fill replaces all unset or invalid values with default.
 func (s *State) fill() {
 	if _, err := uuid.Parse(s.UUID); err != nil {
-		s.UUID = must.NotFail(uuid.NewRandom()).String()
+		s.UUID = uuid.NewString()
 	}
 
 	if s.Start.IsZero() {
@@ -54,10 +89,14 @@ func (s *State) deepCopy() *State {
 	}
 
 	return &State{
-		UUID:           s.UUID,
-		Telemetry:      telemetry,
-		Start:          s.Start,
-		LatestVersion:  s.LatestVersion,
-		HandlerVersion: s.HandlerVersion,
+		UUID:              s.UUID,
+		Telemetry:         telemetry,
+		TelemetryLocked:   s.TelemetryLocked,
+		Start:             s.Start,
+		PostgreSQLVersion: s.PostgreSQLVersion,
+		DocumentDBVersion: s.DocumentDBVersion,
+		LatestVersion:     s.LatestVersion,
+		UpdateInfo:        s.UpdateInfo,
+		UpdateAvailable:   s.UpdateAvailable,
 	}
 }

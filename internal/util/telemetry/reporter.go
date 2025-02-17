@@ -19,44 +19,62 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 
-	"github.com/AlekSi/pointer"
-	"go.uber.org/zap"
-
-	"github.com/FerretDB/FerretDB/internal/clientconn/connmetrics"
-	"github.com/FerretDB/FerretDB/internal/util/state"
-	"github.com/FerretDB/FerretDB/internal/util/version"
+	"github.com/FerretDB/FerretDB/v2/build/version"
+	"github.com/FerretDB/FerretDB/v2/internal/clientconn/connmetrics"
+	"github.com/FerretDB/FerretDB/v2/internal/util/ctxutil"
+	"github.com/FerretDB/FerretDB/v2/internal/util/logging"
+	"github.com/FerretDB/FerretDB/v2/internal/util/state"
 )
 
-// request represents telemetry request.
-type request struct {
-	Version          string         `json:"version"`
-	Commit           string         `json:"commit"`
-	Branch           string         `json:"branch"`
-	Dirty            bool           `json:"dirty"`
-	Debug            bool           `json:"debug"`
-	BuildEnvironment map[string]any `json:"build_environment"`
-	OS               string         `json:"os"`
-	Arch             string         `json:"arch"`
+// Time format for local file.
+const fileTimeFormat = "2006-01-02 15:04:05Z07:00"
 
-	HandlerVersion string `json:"handler_version"` // PostgreSQL, Tigris, etc version
+// report represents telemetry data to report.
+//
+//nolint:vet // for readability
+type report struct {
+	Comment string `json:"_comment,omitempty"` // for local file only
+
+	Version          string            `json:"version"`
+	Commit           string            `json:"commit"`
+	Branch           string            `json:"branch"`
+	Dirty            bool              `json:"dirty"`
+	Package          string            `json:"package"`
+	Debug            bool              `json:"debug"`
+	BuildEnvironment map[string]string `json:"build_environment"`
+	OS               string            `json:"os"`
+	Arch             string            `json:"arch"`
+
+	PostgreSQLVersion string `json:"postgresql_version"`
+	DocumentDBVersion string `json:"documentdb_version"`
 
 	UUID   string        `json:"uuid"`
 	Uptime time.Duration `json:"uptime"`
 
-	// opcode (e.g. "OP_MSG") -> command (e.g. "update") -> argument (e.g. "$set") -> result (e.g. "ok") -> count
+	// opcode (e.g. "OP_MSG", "OP_QUERY") ->
+	// command (e.g. "find", "aggregate") ->
+	// argument that caused an error (e.g. "sort", "$count (stage)"; or "unknown") ->
+	// result (e.g. "NotImplemented", "InternalError"; or "ok") ->
+	// count.
 	CommandMetrics map[string]map[string]map[string]map[string]int `json:"command_metrics"`
 }
 
-// response represents telemetry response.
+// response represents Beacon's response.
 type response struct {
-	LatestVersion string `json:"latest_version"`
+	LatestVersion   string `json:"latest_version"`
+	UpdateInfo      string `json:"update_info"`
+	UpdateAvailable bool   `json:"update_available"`
 }
 
-// Reporter sends telemetry reports if telemetry is enabled.
+// Reporter converts already collected data (such as metrics) to the report,
+// sends it to the Beacon if telemetry reporting is enabled,
+// and writes it to a local file in the state directory.
 type Reporter struct {
 	*NewReporterOpts
 	c *http.Client
@@ -65,25 +83,37 @@ type Reporter struct {
 // NewReporterOpts represents reporter options.
 type NewReporterOpts struct {
 	URL            string
+	File           string
 	F              *Flag
 	DNT            string
 	ExecName       string
 	P              *state.Provider
 	ConnMetrics    *connmetrics.ConnMetrics
-	L              *zap.Logger
+	L              *slog.Logger
 	UndecidedDelay time.Duration
 	ReportInterval time.Duration
-	ReportTimeout  time.Duration
 }
 
 // NewReporter creates a new reporter.
 func NewReporter(opts *NewReporterOpts) (*Reporter, error) {
-	t, err := initialState(opts.F, opts.DNT, opts.ExecName, opts.P.Get().Telemetry, opts.L)
+	if opts.URL == "" {
+		return nil, fmt.Errorf("URL is required")
+	}
+
+	if opts.File == "" {
+		return nil, fmt.Errorf("File is required")
+	}
+
+	t, locked, err := initialState(opts.F, opts.DNT, opts.ExecName, opts.P.Get().Telemetry, opts.L)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = opts.P.Update(func(s *state.State) { s.Telemetry = t }); err != nil {
+	err = opts.P.Update(func(s *state.State) {
+		s.Telemetry = t
+		s.TelemetryLocked = locked
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -95,43 +125,50 @@ func NewReporter(opts *NewReporterOpts) (*Reporter, error) {
 
 // Run runs reporter until context is canceled.
 func (r *Reporter) Run(ctx context.Context) {
-	r.L.Debug("Reporter started.")
-	defer r.L.Debug("Reporter stopped.")
+	r.L.DebugContext(ctx, "Reporter started")
+	defer r.L.DebugContext(ctx, "Reporter stopped")
 
-	ch := r.P.Subscribe()
-
-	r.firstReportDelay(ctx, ch)
-
-	for ctx.Err() == nil {
-		r.report(ctx)
-
-		delayCtx, delayCancel := context.WithTimeout(ctx, r.ReportInterval)
-		<-delayCtx.Done()
-		delayCancel()
+	// no delay for decided state
+	if r.P.Get().Telemetry == nil {
+		r.firstReportDelay(ctx)
 	}
 
-	// do one last report before exiting if telemetry is explicitly enabled
-	if pointer.GetBool(r.P.Get().Telemetry) {
-		r.report(context.Background())
+	for context.Cause(ctx) == nil {
+		report := r.makeReport()
+
+		if s := r.P.Get(); s.Telemetry == nil || *s.Telemetry {
+			r.sendReport(ctx, report)
+		}
+
+		r.writeReport(report)
+
+		ctxutil.Sleep(ctx, r.ReportInterval)
 	}
+
+	report := r.makeReport()
+
+	// send one last time before exiting only if explicitly enabled (not undecided)
+	if s := r.P.Get(); s.Telemetry != nil && *s.Telemetry {
+		r.sendReport(ctx, report)
+	}
+
+	r.writeReport(report)
 }
 
 // firstReportDelay waits until telemetry reporting state is decided,
-// main context is cancelled, or timeout is reached.
-func (r *Reporter) firstReportDelay(ctx context.Context, ch <-chan struct{}) {
-	if r.P.Get().Telemetry != nil {
-		return
-	}
-
+// context is canceled, or UndecidedDelay is reached.
+func (r *Reporter) firstReportDelay(ctx context.Context) {
 	msg := fmt.Sprintf(
 		"The telemetry state is undecided; the first report will be sent in %s. "+
-			"Read more about FerretDB telemetry and how to opt out at https://beacon.ferretdb.io.",
+			"Read more about FerretDB telemetry and how to opt out at https://beacon.ferretdb.com.",
 		r.UndecidedDelay,
 	)
-	r.L.Info(msg)
+	r.L.InfoContext(ctx, msg)
 
 	delayCtx, delayCancel := context.WithTimeout(ctx, r.UndecidedDelay)
 	defer delayCancel()
+
+	ch := r.P.Subscribe()
 
 	for {
 		select {
@@ -145,11 +182,11 @@ func (r *Reporter) firstReportDelay(ctx context.Context, ch <-chan struct{}) {
 	}
 }
 
-// makeRequest creates a new telemetry request.
-func makeRequest(s *state.State, m *connmetrics.ConnMetrics) *request {
+// makeReport converts runtime state, metrics, and build information to telemetry data.
+func (r *Reporter) makeReport() *report {
 	commandMetrics := map[string]map[string]map[string]map[string]int{}
 
-	for opcode, commands := range m.GetResponses() {
+	for opcode, commands := range r.ConnMetrics.GetResponses() {
 		for command, arguments := range commands {
 			for argument, m := range arguments {
 				if _, ok := commandMetrics[opcode]; !ok {
@@ -179,19 +216,22 @@ func makeRequest(s *state.State, m *connmetrics.ConnMetrics) *request {
 		}
 	}
 
-	v := version.Get()
+	info := version.Get()
+	s := r.P.Get()
 
-	return &request{
-		Version:          v.Version,
-		Commit:           v.Commit,
-		Branch:           v.Branch,
-		Dirty:            v.Dirty,
-		Debug:            v.Debug,
-		BuildEnvironment: v.BuildEnvironment.Map(),
+	return &report{
+		Version:          info.Version,
+		Commit:           info.Commit,
+		Branch:           info.Branch,
+		Dirty:            info.Dirty,
+		Package:          info.Package,
+		Debug:            info.DevBuild,
+		BuildEnvironment: info.BuildEnvironment,
 		OS:               runtime.GOOS,
 		Arch:             runtime.GOARCH,
 
-		HandlerVersion: s.HandlerVersion,
+		PostgreSQLVersion: s.PostgreSQLVersion,
+		DocumentDBVersion: s.DocumentDBVersion,
 
 		UUID:   s.UUID,
 		Uptime: time.Since(s.Start),
@@ -200,29 +240,26 @@ func makeRequest(s *state.State, m *connmetrics.ConnMetrics) *request {
 	}
 }
 
-// report sends telemetry report unless telemetry is disabled.
-func (r *Reporter) report(ctx context.Context) {
-	s := r.P.Get()
-	if s.Telemetry != nil && !*s.Telemetry {
-		r.L.Debug("Telemetry is disabled, skipping reporting.")
-		return
-	}
-
-	request := makeRequest(s, r.ConnMetrics)
-	r.L.Info("Reporting telemetry.", zap.Reflect("data", request))
-
-	b, err := json.Marshal(request)
+// sendReport sends telemetry report to the Beacon.
+// It always set report.Comment field.
+//
+// It receives information about available updates and updates the state.
+// If update is available, it logs the message.
+func (r *Reporter) sendReport(ctx context.Context, report *report) {
+	r.L.InfoContext(ctx, "Sending telemetry report", slog.String("url", r.URL), slog.Any("data", report))
+	b, err := json.Marshal(report)
+	report.Comment = fmt.Sprintf("Failed to send to %s at %s.", r.URL, time.Now().Format(fileTimeFormat))
 	if err != nil {
-		r.L.Error("Failed to marshal telemetry request.", zap.Error(err))
+		r.L.ErrorContext(ctx, "Failed to marshal telemetry report", logging.Error(err))
 		return
 	}
 
-	reqCtx, reqCancel := context.WithTimeout(ctx, r.ReportTimeout)
+	reqCtx, reqCancel := context.WithTimeout(ctx, 3*time.Second)
 	defer reqCancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, r.URL, bytes.NewReader(b))
 	if err != nil {
-		r.L.Error("Failed to create telemetry request.", zap.Error(err))
+		r.L.ErrorContext(ctx, "Failed to create telemetry request", logging.Error(err))
 		return
 	}
 
@@ -230,40 +267,65 @@ func (r *Reporter) report(ctx context.Context) {
 
 	res, err := r.c.Do(req)
 	if err != nil {
-		r.L.Debug("Failed to send telemetry request.", zap.Error(err))
+		r.L.DebugContext(ctx, "Failed to send telemetry report", logging.Error(err))
 		return
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusCreated {
-		r.L.Debug("Failed to send telemetry request.", zap.Int("status", res.StatusCode))
+		r.L.DebugContext(ctx, "Failed to send telemetry report", slog.Int("status", res.StatusCode))
 		return
 	}
 
 	var response response
 	if err = json.NewDecoder(res.Body).Decode(&response); err != nil {
-		r.L.Debug("Failed to read telemetry response.", zap.Error(err))
+		r.L.DebugContext(ctx, "Failed to read telemetry response", logging.Error(err))
 		return
 	}
 
-	if response.LatestVersion == "" {
-		r.L.Debug("No latest version in telemetry response.")
-		return
+	r.L.DebugContext(ctx, "Read telemetry response", slog.Any("response", response))
+
+	if response.UpdateInfo != "" || response.UpdateAvailable {
+		msg := response.UpdateInfo
+		if msg == "" {
+			msg = "A new version available!"
+		}
+
+		r.L.InfoContext(
+			ctx,
+			msg,
+			slog.String("current_version", report.Version),
+			slog.String("latest_version", response.LatestVersion),
+		)
 	}
 
-	if response.LatestVersion == s.LatestVersion {
-		r.L.Debug("Latest version is up to date.")
-		return
+	if err = r.P.Update(func(s *state.State) {
+		s.LatestVersion = response.LatestVersion
+		s.UpdateInfo = response.UpdateInfo
+		s.UpdateAvailable = response.UpdateAvailable
+	}); err != nil {
+		r.L.ErrorContext(ctx, "Failed to update state with latest version", logging.Error(err))
 	}
 
-	r.L.Info(
-		"New version available.",
-		zap.String("current_version", request.Version), zap.String("latest_version", response.LatestVersion),
-	)
+	report.Comment = fmt.Sprintf("Sent to %s at %s.", r.URL, time.Now().Format(fileTimeFormat))
+}
 
-	err = r.P.Update(func(s *state.State) { s.LatestVersion = response.LatestVersion })
+// writeReport writes telemetry report to the local files.
+func (r *Reporter) writeReport(report *report) {
+	if report.Comment == "" {
+		report.Comment = fmt.Sprintf("Created at %s, not sent because reporting is disabled.", time.Now().Format(fileTimeFormat))
+	}
+
+	b, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		r.L.Error("Failed to update state with latest version.", zap.Error(err))
+		r.L.Error("Failed to marshal telemetry report", logging.Error(err))
 		return
 	}
+
+	if err = os.WriteFile(r.File, b, 0o666); err != nil {
+		r.L.Error("Failed to write telemetry report to local file", slog.String("file", r.File), logging.Error(err))
+		return
+	}
+
+	r.L.Info("Wrote telemetry report to local file", slog.String("file", r.File))
 }

@@ -15,7 +15,6 @@
 package integration
 
 import (
-	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,367 +23,282 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/FerretDB/FerretDB/integration/setup"
-	"github.com/FerretDB/FerretDB/integration/shareddata"
+	"github.com/FerretDB/FerretDB/v2/integration/setup"
+	"github.com/FerretDB/FerretDB/v2/integration/shareddata"
 )
 
-func TestQueryProjection(t *testing.T) {
-	setup.SkipForTigris(t)
-
+func TestQueryProjectionErrors(t *testing.T) {
 	t.Parallel()
-	providers := []shareddata.Provider{shareddata.Composites}
-	ctx, collection := setup.Setup(t, providers...)
 
-	_, err := collection.InsertMany(ctx, []any{
-		bson.D{
-			{"_id", "document-composite-2"},
-			{"v", bson.A{
-				bson.D{{"field", int32(42)}},
-				bson.D{{"field", int32(44)}},
-			}},
-		},
-	})
-	require.NoError(t, err)
+	ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
 
-	for name, tc := range map[string]struct {
-		projection any
-		filter     any
-		expected   bson.D
+	for name, tc := range map[string]struct { //nolint:vet // used for testing only
+		filter     bson.D // required
+		projection any    // required
+
+		err              *mongo.CommandError // required, expected error from MongoDB
+		altMessage       string              // optional, alternative error message for FerretDB, ignored if empty
+		failsForFerretDB string
 	}{
-		"FindProjectionInclusions": {
-			filter: bson.D{{"_id", "document-composite"}},
-			// TODO: https://github.com/FerretDB/FerretDB/issues/537
-			projection: bson.D{{"foo", int32(1)}, {"42", true}},
-			expected:   bson.D{{"_id", "document-composite"}},
+		"EmptyKey": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"", true}},
+			err: &mongo.CommandError{
+				Code:    40352,
+				Name:    "Location40352",
+				Message: "FieldPath cannot be constructed with empty string",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
 		},
-		"FindProjectionExclusions": {
-			filter: bson.D{{"_id", "document-composite"}},
-			// TODO: https://github.com/FerretDB/FerretDB/issues/537
-			projection: bson.D{{"foo", int32(0)}, {"array", false}},
-			expected:   bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(42)}, {"42", "foo"}, {"array", bson.A{int32(42), "foo", nil}}}}},
+		"EmptyPath": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"v..d", true}},
+			err: &mongo.CommandError{
+				Code:    15998,
+				Name:    "Location15998",
+				Message: "FieldPath field names may not be empty strings.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
 		},
-		"FindProjectionIDExclusion": {
-			filter: bson.D{{"_id", "document-composite"}},
-			// TODO: https://github.com/FerretDB/FerretDB/issues/537
-			projection: bson.D{{"_id", false}, {"array", int32(1)}},
-			expected:   bson.D{},
+		"ExcludeInclude": {
+			filter:     bson.D{},
+			projection: bson.D{{"foo", false}, {"bar", true}},
+			err: &mongo.CommandError{
+				Code:    31253,
+				Name:    "Location31253",
+				Message: "Cannot do inclusion on field bar in exclusion projection",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
 		},
-		"ProjectionSliceNonArrayField": {
-			filter:     bson.D{{"_id", "document"}},
-			projection: bson.D{{"_id", bson.D{{"$slice", 1}}}},
-			expected:   bson.D{{"_id", "document"}, {"v", bson.D{{"foo", int32(42)}}}},
+		"IncludeExclude": {
+			filter:     bson.D{},
+			projection: bson.D{{"foo", true}, {"bar", false}},
+			err: &mongo.CommandError{
+				Code:    31254,
+				Name:    "Location31254",
+				Message: "Cannot do exclusion on field bar in inclusion projection",
+			},
+			altMessage: "Cannot do exclusion on field bar in inclusion projection.",
+		},
+		"PositionalOperatorMultiple": {
+			filter:     bson.D{{"_id", "array-numbers-asc"}},
+			projection: bson.D{{"v.$.foo.$", true}},
+			err: &mongo.CommandError{
+				Code: 31394,
+				Name: "Location31394",
+				Message: "As of 4.4, it's illegal to specify positional operator " +
+					"in the middle of a path.Positional projection may only be " +
+					"used at the end, for example: a.b.$. If the query previously " +
+					"used a form like a.b.$.d, remove the parts following the '$' and " +
+					"the results will be equivalent.",
+			},
+			altMessage: "Positional projection may only be used at the end, " +
+				"for example: a.b.$. If the query previously used a form " +
+				"like a.b.$.d, remove the parts following the '$' and " +
+				"the results will be equivalent.",
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorMiddle": {
+			filter:     bson.D{{"_id", "array-numbers-asc"}},
+			projection: bson.D{{"v.$.foo", true}},
+			err: &mongo.CommandError{
+				Code: 31394,
+				Name: "Location31394",
+				Message: "As of 4.4, it's illegal to specify positional operator " +
+					"in the middle of a path.Positional projection may only be " +
+					"used at the end, for example: a.b.$. If the query previously " +
+					"used a form like a.b.$.d, remove the parts following the '$' and " +
+					"the results will be equivalent.",
+			},
+			altMessage: "Positional projection may only be used at the end, " +
+				"for example: a.b.$. If the query previously used a form " +
+				"like a.b.$.d, remove the parts following the '$' and " +
+				"the results will be equivalent.",
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorWrongLocations": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"$.v.$.foo", true}},
+			err: &mongo.CommandError{
+				Code: 31394,
+				Name: "Location31394",
+				Message: "As of 4.4, it's illegal to specify positional operator " +
+					"in the middle of a path.Positional projection may only be " +
+					"used at the end, for example: a.b.$. If the query previously " +
+					"used a form like a.b.$.d, remove the parts following the '$' and " +
+					"the results will be equivalent.",
+			},
+			altMessage: "Positional projection may only be " +
+				"used at the end, for example: a.b.$. If the query previously " +
+				"used a form like a.b.$.d, remove the parts following the '$' and " +
+				"the results will be equivalent.",
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorEmptyFilter": {
+			filter:     bson.D{},
+			projection: bson.D{{"v.$", true}},
+			err: &mongo.CommandError{
+				Code: 51246,
+				Name: "Location51246",
+				Message: "Executor error during find command :: caused by :: " +
+					"positional operator '.$' couldn't find a matching element in the array",
+			},
+		},
+		"PositionalOperatorEmptyArrayID": {
+			filter:     bson.D{{"_id", "array-empty"}},
+			projection: bson.D{{"v.$", true}},
+			err: &mongo.CommandError{
+				Code:    51246,
+				Name:    "Location51246",
+				Message: "Executor error during find command :: caused by :: positional operator '.$' couldn't find a matching element in the array",
+			},
+		},
+		"PositionalOperatorFilterMissingPath": {
+			// it returns error only if collection contains a doc that matches the filter
+			// and the filter does not contain positional operator path,
+			// e.g. missing {v: <val>} in the filter.
+			filter:     bson.D{{"_id", "array"}},
+			projection: bson.D{{"v.$", true}},
+			err: &mongo.CommandError{
+				Code:    51246,
+				Name:    "Location51246",
+				Message: "Executor error during find command :: caused by :: positional operator '.$' couldn't find a matching element in the array",
+			},
+		},
+		"PositionalOperatorMismatch": {
+			// positional projection only handles one array at the suffix,
+			// path prefixes cannot contain array.
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"v.foo.$", true}},
+			err: &mongo.CommandError{
+				Code:    51247,
+				Name:    "Location51247",
+				Message: "Executor error during find command :: caused by :: positional operator '.$' element mismatch",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorEmptyPath": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"v..$", true}},
+			err: &mongo.CommandError{
+				Code:    40353,
+				Name:    "Location40353",
+				Message: "FieldPath must not end with a '.'.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorDollarKey": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"$", true}},
+			err: &mongo.CommandError{
+				Code:    16410,
+				Name:    "Location16410",
+				Message: "FieldPath field names may not start with '$'. Consider using $getField or $setField.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorDollarInKey": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"$v", true}},
+			err: &mongo.CommandError{
+				Code:    16410,
+				Name:    "Location16410",
+				Message: "FieldPath field names may not start with '$'. Consider using $getField or $setField.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorDollarPrefix": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"$.foo", true}},
+			err: &mongo.CommandError{
+				Code:    16410,
+				Name:    "Location16410",
+				Message: "FieldPath field names may not start with '$'. Consider using $getField or $setField.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorDotNotationDollarInKey": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"v.$foo", true}},
+			err: &mongo.CommandError{
+				Code:    16410,
+				Name:    "Location16410",
+				Message: "FieldPath field names may not start with '$'. Consider using $getField or $setField.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorPrefixSuffix": {
+			filter:     bson.D{{"_id", "array-numbers-asc"}},
+			projection: bson.D{{"$.foo.$", true}},
+			err: &mongo.CommandError{
+				Code:    16410,
+				Name:    "Location16410",
+				Message: "FieldPath field names may not start with '$'. Consider using $getField or $setField.",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/241",
+		},
+		"PositionalOperatorExclusion": {
+			filter:     bson.D{{"v", 42}},
+			projection: bson.D{{"v.$", false}},
+			err: &mongo.CommandError{
+				Code:    31395,
+				Name:    "Location31395",
+				Message: "positional projection cannot be used with exclusion",
+			},
 		},
 	} {
-		name, tc := name, tc
+		t.Run(name, func(tt *testing.T) {
+			tt.Parallel()
+
+			var t testing.TB = tt
+			if tc.failsForFerretDB != "" {
+				t = setup.FailsForFerretDB(tt, tc.failsForFerretDB)
+			}
+
+			require.NotNil(t, tc.filter, "filter should be set")
+			require.NotNil(t, tc.projection, "projection should be set")
+			require.NotNil(t, tc.err, "err should be set")
+
+			res, err := collection.Find(ctx, tc.filter, options.Find().SetProjection(tc.projection))
+
+			assert.Nil(t, res)
+			AssertEqualAltCommandError(t, *tc.err, tc.altMessage, err)
+		})
+	}
+}
+
+func TestQueryProjectionSuccess(t *testing.T) {
+	t.Parallel()
+	ctx, collection := setup.Setup(t, shareddata.Scalars)
+
+	for name, tc := range map[string]struct { //nolint:vet // used for testing only
+		filter     bson.D   // required
+		projection any      // required
+		res        []bson.D // required
+	}{
+		"QueryProjectionOfFieldV": {
+			filter:     bson.D{{"_id", "int32"}},
+			projection: bson.D{{"v", true}, {"_id", false}},
+			res: []bson.D{
+				{{"v", int32(42)}},
+			},
+		},
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+
+			require.NotNil(t, tc.filter, "filter should be set")
+			require.NotNil(t, tc.projection, "projection should be set")
+			require.NotNil(t, tc.res, "res should be set")
 
 			cursor, err := collection.Find(ctx, tc.filter, options.Find().SetProjection(tc.projection))
 			require.NoError(t, err)
+			defer cursor.Close(ctx)
 
-			var actual []bson.D
-			err = cursor.All(ctx, &actual)
+			var res []bson.D
+			err = cursor.All(ctx, &res)
 			require.NoError(t, err)
-			require.Len(t, actual, 1)
-			AssertEqualDocuments(t, tc.expected, actual[0])
-		})
-	}
-}
-
-func TestQueryProjectionElemMatch(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-	providers := []shareddata.Provider{shareddata.Composites}
-	ctx, collection := setup.Setup(t, providers...)
-
-	_, err := collection.InsertMany(ctx, []any{
-		bson.D{
-			{"_id", "document-composite-2"},
-			{"v", bson.A{
-				bson.D{{"field", int32(42)}},
-				bson.D{{"field", int32(44)}},
-			}},
-		},
-	})
-	require.NoError(t, err)
-
-	for name, tc := range map[string]struct {
-		projection  any
-		expectedIDs []any
-	}{
-		"ElemMatch": {
-			projection: bson.D{{
-				"v",
-				bson.D{{"$elemMatch", bson.D{{"field", bson.D{{"$eq", 42}}}}}},
-			}},
-			expectedIDs: []any{
-				"document-composite-2",
-			},
-		},
-	} {
-		name, tc := name, tc
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			cursor, err := collection.Find(
-				ctx,
-				bson.D{{"_id", "document-composite-2"}},
-				options.Find().SetProjection(tc.projection),
-				options.Find().SetSort(bson.D{{"_id", 1}}),
-			)
-			require.NoError(t, err)
-
-			var actual []bson.D
-			err = cursor.All(ctx, &actual)
-			require.NoError(t, err)
-			assert.Equal(t, tc.expectedIDs, CollectIDs(t, actual))
-		})
-	}
-}
-
-func TestQueryProjectionSlice(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-	ctx, collection := setup.Setup(t)
-	_, err := collection.InsertOne(ctx,
-		bson.D{{"_id", "array"}, {"v", bson.A{1, 2, 3, 4}}},
-	)
-	require.NoError(t, err)
-
-	for name, tc := range map[string]struct {
-		projection    bson.D
-		expectedArray bson.A
-		err           *mongo.CommandError
-		altMessage    string
-	}{
-		"SingleArgDocument": {
-			projection: bson.D{{"v", bson.D{
-				{"$slice", bson.D{{"a", bson.D{{"b", 3}}}, {"b", "string"}}},
-			}}},
-			err: &mongo.CommandError{
-				Code: 28667,
-				Name: "Location28667",
-				Message: "Invalid $slice syntax. The given syntax { $slice: { a: { b: 3 }, b: \"string\" } } " +
-					"did not match the find() syntax because :: Location31273: " +
-					"$slice only supports numbers and [skip, limit] arrays " +
-					":: The given syntax did not match the expression $slice syntax. " +
-					":: caused by :: Expression $slice takes at least 2 arguments, and at most 3, " +
-					"but 1 were passed in.",
-			},
-			altMessage: "Invalid $slice syntax. The given syntax " +
-				"did not match the find() syntax because :: Location31273: " +
-				"$slice only supports numbers and [skip, limit] arrays " +
-				":: The given syntax did not match the expression $slice syntax. " +
-				":: caused by :: Expression $slice takes at least 2 arguments, and at most 3, " +
-				"but 1 were passed in.",
-		},
-		"SingleArgString": {
-			projection: bson.D{{"v", bson.D{{"$slice", "string"}}}},
-			err: &mongo.CommandError{
-				Code: 28667,
-				Name: "Location28667",
-				Message: "Invalid $slice syntax. The given syntax { $slice: \"string\" } " +
-					"did not match the find() syntax because :: Location31273: " +
-					"$slice only supports numbers and [skip, limit] arrays " +
-					":: The given syntax did not match the expression $slice syntax. " +
-					":: caused by :: Expression $slice takes at least 2 arguments, and at most 3, " +
-					"but 1 were passed in.",
-			},
-			altMessage: "Invalid $slice syntax. The given syntax " +
-				"did not match the find() syntax because :: Location31273: " +
-				"$slice only supports numbers and [skip, limit] arrays " +
-				":: The given syntax did not match the expression $slice syntax. " +
-				":: caused by :: Expression $slice takes at least 2 arguments, and at most 3, " +
-				"but 1 were passed in.",
-		},
-		"SkipIsString": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{"string", 5}}}}},
-			err: &mongo.CommandError{
-				Code:    28724,
-				Name:    "Location28724",
-				Message: "First argument to $slice must be an array, but is of type: string",
-			},
-		},
-		"LimitIsString": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{int32(2), "string"}}}}},
-			err: &mongo.CommandError{
-				Code:    28724,
-				Name:    "Location28724",
-				Message: "First argument to $slice must be an array, but is of type: int",
-			},
-		},
-		"ArgEmptyArr": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{}}}}},
-			err: &mongo.CommandError{
-				Code: 28667,
-				Name: "Location28667",
-				Message: "Invalid $slice syntax. The given syntax { $slice: [] } " +
-					"did not match the find() syntax because :: Location31272: " +
-					"$slice array argument should be of form [skip, limit] :: " +
-					"The given syntax did not match the expression " +
-					"$slice syntax. :: caused by :: " +
-					"Expression $slice takes at least 2 arguments, and at most 3, but 0 were passed in.",
-			},
-			altMessage: "Invalid $slice syntax. The given syntax " +
-				"did not match the find() syntax because :: Location31272: " +
-				"$slice array argument should be of form [skip, limit] :: " +
-				"The given syntax did not match the expression " +
-				"$slice syntax. :: caused by :: " +
-				"Expression $slice takes at least 2 arguments, and at most 3, but 0 were passed in.",
-		},
-		"ThreeArgs": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{"string", 2, 3}}}}},
-			err: &mongo.CommandError{
-				Code:    28724,
-				Name:    "Location28724",
-				Message: "First argument to $slice must be an array, but is of type: string",
-			},
-		},
-		"TooManyArgs": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{1, 2, 3, 4}}}}},
-			err: &mongo.CommandError{
-				Code: 28667,
-				Name: "Location28667",
-				Message: "Invalid $slice syntax. The given syntax { $slice: [ 1, 2, 3, 4 ] } " +
-					"did not match the find() syntax because :: Location31272: " +
-					"$slice array argument should be of form [skip, limit] :: " +
-					"The given syntax did not match the expression " +
-					"$slice syntax. :: caused by :: " +
-					"Expression $slice takes at least 2 arguments, and at most 3, but 4 were passed in.",
-			},
-			altMessage: "Invalid $slice syntax. The given syntax " +
-				"did not match the find() syntax because :: Location31272: " +
-				"$slice array argument should be of form [skip, limit] :: " +
-				"The given syntax did not match the expression " +
-				"$slice syntax. :: caused by :: " +
-				"Expression $slice takes at least 2 arguments, and at most 3, but 4 were passed in.",
-		},
-		"Int64SingleArg": {
-			projection:    bson.D{{"v", bson.D{{"$slice", int64(2)}}}},
-			expectedArray: bson.A{int32(1), int32(2)},
-		},
-		"PositiveSingleArg": {
-			projection:    bson.D{{"v", bson.D{{"$slice", 2}}}},
-			expectedArray: bson.A{int32(1), int32(2)},
-		},
-		"NegativeSingleArg": {
-			projection:    bson.D{{"v", bson.D{{"$slice", -2}}}},
-			expectedArray: bson.A{int32(3), int32(4)},
-		},
-		"SingleArgFloat": {
-			projection:    bson.D{{"v", bson.D{{"$slice", 1.4}}}},
-			expectedArray: bson.A{int32(1)},
-		},
-		"SkipFloat": {
-			projection:    bson.D{{"v", bson.D{{"$slice", bson.A{-2.5, 2}}}}},
-			expectedArray: bson.A{int32(3), int32(4)},
-		},
-		"LimitFloat": {
-			projection:    bson.D{{"v", bson.D{{"$slice", bson.A{1, 2.8}}}}},
-			expectedArray: bson.A{int32(2), int32(3)},
-		},
-		"PositiveSkip": {
-			projection:    bson.D{{"v", bson.D{{"$slice", bson.A{1, 2}}}}},
-			expectedArray: bson.A{int32(2), int32(3)},
-		},
-		"NegativeSkip": {
-			projection:    bson.D{{"v", bson.D{{"$slice", bson.A{-3, 2}}}}},
-			expectedArray: bson.A{int32(2), int32(3)},
-		},
-		"NegativeLimitSkipInt64": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{int64(3), -2}}}}},
-			err: &mongo.CommandError{
-				Code:    28724,
-				Name:    "Location28724",
-				Message: "First argument to $slice must be an array, but is of type: long",
-			},
-		},
-		"NegativeLimitSkipInt": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{3, -2}}}}},
-			err: &mongo.CommandError{
-				Code:    28724,
-				Name:    "Location28724",
-				Message: "First argument to $slice must be an array, but is of type: int",
-			},
-		},
-		"NegativeLimitSkipFloat": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{0.3, -2}}}}},
-			err: &mongo.CommandError{
-				Code:    28724,
-				Name:    "Location28724",
-				Message: "First argument to $slice must be an array, but is of type: double",
-			},
-		},
-		"ArgNaN": {
-			projection:    bson.D{{"v", bson.D{{"$slice", math.NaN()}}}},
-			expectedArray: bson.A{},
-		},
-		"ArgInf": {
-			projection:    bson.D{{"v", bson.D{{"$slice", math.Inf(+1)}}}},
-			expectedArray: bson.A{int32(1), int32(2), int32(3), int32(4)},
-		},
-		"SingleArgNull": {
-			projection: bson.D{{"v", bson.D{{"$slice", nil}}}},
-			err: &mongo.CommandError{
-				Code: 28667,
-				Name: "Location28667",
-				Message: "Invalid $slice syntax. " +
-					"The given syntax { $slice: null } did not match the find() syntax " +
-					"because :: Location31273: $slice only supports numbers and [skip, limit] arrays :: " +
-					"The given syntax did not match the expression $slice syntax. :: caused by :: " +
-					"Expression $slice takes at least 2 arguments, and at most 3, but 1 were passed in.",
-			},
-			altMessage: "Invalid $slice syntax. " +
-				"The given syntax did not match the find() syntax " +
-				"because :: Location31273: $slice only supports numbers and [skip, limit] arrays :: " +
-				"The given syntax did not match the expression $slice syntax. :: caused by :: " +
-				"Expression $slice takes at least 2 arguments, and at most 3, but 1 were passed in.",
-		},
-		"NullInArr": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{nil}}}}},
-			err: &mongo.CommandError{
-				Code: 28667,
-				Name: "Location28667",
-				Message: "Invalid $slice syntax. The given syntax { $slice: [ null ] } " +
-					"did not match the find() syntax because :: Location31272: " +
-					"$slice array argument should be of form [skip, limit] " +
-					":: The given syntax did not match the expression $slice syntax. " +
-					":: caused by :: Expression $slice takes at least 2 arguments, " +
-					"and at most 3, but 1 were passed in.",
-			},
-			altMessage: "Invalid $slice syntax. The given syntax " +
-				"did not match the find() syntax because :: Location31272: " +
-				"$slice array argument should be of form [skip, limit] " +
-				":: The given syntax did not match the expression $slice syntax. " +
-				":: caused by :: Expression $slice takes at least 2 arguments, " +
-				"and at most 3, but 1 were passed in.",
-		},
-		"NullInPair": {
-			projection: bson.D{{"v", bson.D{{"$slice", bson.A{2, nil}}}}},
-		},
-	} {
-		name, tc := name, tc
-		t.Run(name, func(t *testing.T) {
-			res := collection.FindOne(ctx, bson.D{}, options.FindOne().SetProjection(tc.projection))
-			err = res.Err()
-			if tc.err != nil {
-				require.Nil(t, tc.expectedArray)
-				AssertEqualAltError(t, *tc.err, tc.altMessage, err)
-				return
-			}
-			require.NoError(t, err)
-
-			var actual bson.D
-			err = res.Decode(&actual)
-			require.NoError(t, err)
-
-			if tc.expectedArray == nil {
-				assert.Nil(t, actual.Map()["v"])
-				return
-			}
-			assert.Equal(t, tc.expectedArray, actual.Map()["v"])
+			assert.Equal(t, tc.res, res)
 		})
 	}
 }

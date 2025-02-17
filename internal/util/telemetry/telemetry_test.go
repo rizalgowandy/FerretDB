@@ -20,9 +20,8 @@ import (
 	"github.com/AlekSi/pointer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 
-	"github.com/FerretDB/FerretDB/internal/util/testutil"
+	"github.com/FerretDB/FerretDB/v2/internal/util/testutil"
 )
 
 func TestState(t *testing.T) {
@@ -34,6 +33,7 @@ func TestState(t *testing.T) {
 		execName string
 		prev     *bool
 		state    *bool
+		locked   bool
 		err      string
 	}{
 		"default": {},
@@ -42,13 +42,19 @@ func TestState(t *testing.T) {
 			state: pointer.ToBool(false),
 		},
 		"flag": {
-			flag:  "disable",
-			prev:  pointer.ToBool(true),
-			state: pointer.ToBool(false),
+			flag:   "disable",
+			prev:   pointer.ToBool(true),
+			state:  pointer.ToBool(false),
+			locked: true,
 		},
 		"dnt": {
-			dnt:   "1",
-			state: pointer.ToBool(false),
+			dnt:    "1",
+			state:  pointer.ToBool(false),
+			locked: true,
+		},
+		"invalidDnt": {
+			dnt: "foo",
+			err: "failed to parse foo",
 		},
 		"conflict": {
 			flag:     "enable",
@@ -65,14 +71,16 @@ func TestState(t *testing.T) {
 			err := f.UnmarshalText([]byte(tc.flag))
 			require.NoError(t, err)
 
-			logger := testutil.Logger(t, zap.NewAtomicLevelAt(zap.DebugLevel))
-			actualState, actualErr := initialState(&f, tc.dnt, tc.execName, tc.prev, logger)
-			assert.Equal(t, tc.state, actualState)
+			logger := testutil.Logger(t)
+
+			state, locked, err := initialState(&f, tc.dnt, tc.execName, tc.prev, logger)
 			if tc.err != "" {
-				assert.EqualError(t, actualErr, tc.err)
+				assert.EqualError(t, err, tc.err)
 				return
 			}
-			assert.NoError(t, actualErr)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.state, state)
+			assert.Equal(t, tc.locked, locked)
 		})
 	}
 }

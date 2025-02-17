@@ -17,7 +17,6 @@ package integration
 import (
 	"math"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,1429 +25,710 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/FerretDB/FerretDB/integration/setup"
-	"github.com/FerretDB/FerretDB/integration/shareddata"
-	"github.com/FerretDB/FerretDB/internal/types"
-	"github.com/FerretDB/FerretDB/internal/util/testutil"
+	"github.com/FerretDB/FerretDB/v2/integration/setup"
+	"github.com/FerretDB/FerretDB/v2/integration/shareddata"
 )
 
-func TestUpdateFieldCurrentDate(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-
-	t.Run("readBack", func(t *testing.T) {
-		maxDifference := time.Duration(10 * time.Second)
-		nowTimestamp := primitive.Timestamp{T: uint32(time.Now().Unix()), I: uint32(0)}
-		id := "string-empty"
-
-		stat := &mongo.UpdateResult{
-			MatchedCount:  1,
-			ModifiedCount: 1,
-			UpsertedCount: 0,
-		}
-		path := types.NewPathFromString("v")
-		result := bson.D{{"_id", id}, {"v", nowTimestamp}}
-
-		ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-		// store the current timestamp with $currentDate operator;
-		update := bson.D{{"$currentDate", bson.D{{"v", bson.D{{"$type", "timestamp"}}}}}}
-		res, err := collection.UpdateOne(ctx, bson.D{{"_id", id}}, update)
-		require.NoError(t, err)
-		require.Equal(t, stat, res)
-
-		// read it, check that it is close to the current time;
-		var actualBSON bson.D
-		err = collection.FindOne(ctx, bson.D{{"_id", id}}).Decode(&actualBSON)
-		require.NoError(t, err)
-
-		expected := ConvertDocument(t, result)
-		actualDocument := ConvertDocument(t, actualBSON)
-
-		testutil.CompareAndSetByPathTime(t, expected, actualDocument, maxDifference, path)
-
-		// write a new timestamp value with the same time;
-		updateBSON := bson.D{{"$set", bson.D{{"v", nowTimestamp}}}}
-		expectedBSON := bson.D{{"_id", id}, {"v", nowTimestamp}}
-		res, err = collection.UpdateOne(ctx, bson.D{{"_id", id}}, updateBSON)
-		require.NoError(t, err)
-		require.Equal(t, stat, res)
-
-		// read it back, and check that it is still close to the current time.
-		err = collection.FindOne(ctx, bson.D{{"_id", id}}).Decode(&actualBSON)
-		require.NoError(t, err)
-
-		AssertEqualDocuments(t, expectedBSON, actualBSON)
-		actualY := ConvertDocument(t, actualBSON)
-		testutil.CompareAndSetByPathTime(t, actualY, actualDocument, maxDifference, path)
-	})
-
-	t.Run("currentDate", func(t *testing.T) {
-		// maxDifference is a maximum amount of seconds can differ the value in placeholder from actual value
-		maxDifference := time.Duration(3 * time.Minute)
-
-		now := primitive.NewDateTimeFromTime(time.Now().UTC())
-		nowTimestamp := primitive.Timestamp{T: uint32(time.Now().UTC().Unix()), I: uint32(0)}
-
-		for name, tc := range map[string]struct {
-			id       string
-			update   bson.D
-			expected bson.D
-			stat     *mongo.UpdateResult
-			paths    []types.Path
-			err      *mongo.WriteError
-			alt      string
-		}{
-			"DocumentEmpty": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(42.13)}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 0,
-					UpsertedCount: 0,
-				},
-			},
-			"ArrayEmpty": {
-				id:     "double",
-				update: bson.D{{"$currentDate", bson.A{}}},
-				err: &mongo.WriteError{
-					Code: 9,
-					Message: "Modifiers operate on fields but we found type array instead. " +
-						"For example: {$mod: {<field>: ...}} not {$currentDate: []}",
-				},
-				alt: "Modifiers operate on fields but we found another type instead",
-			},
-			"Int32Wrong": {
-				id:     "double",
-				update: bson.D{{"$currentDate", int32(1)}},
-				err: &mongo.WriteError{
-					Code: 9,
-					Message: "Modifiers operate on fields but we found type int instead. " +
-						"For example: {$mod: {<field>: ...}} not {$currentDate: 1}",
-				},
-				alt: "Modifiers operate on fields but we found another type instead",
-			},
-			"Nil": {
-				id:     "double",
-				update: bson.D{{"$currentDate", nil}},
-				err: &mongo.WriteError{
-					Code: 9,
-					Message: "Modifiers operate on fields but we found type null instead. " +
-						"For example: {$mod: {<field>: ...}} not {$currentDate: null}",
-				},
-				alt: "Modifiers operate on fields but we found another type instead",
-			},
-			"BoolTrue": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{{"v", true}}}},
-				expected: bson.D{{"_id", "double"}, {"v", now}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-				paths: []types.Path{types.NewPathFromString("v")},
-			},
-			"BoolTwoTrue": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{{"v", true}, {"unexistent", true}}}},
-				expected: bson.D{{"_id", "double"}, {"v", now}, {"unexistent", now}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-				paths: []types.Path{
-					types.NewPathFromString("v"),
-					types.NewPathFromString("unexistent"),
-				},
-			},
-			"BoolFalse": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{{"v", false}}}},
-				expected: bson.D{{"_id", "double"}, {"v", now}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-				paths: []types.Path{types.NewPathFromString("v")},
-			},
-			"Int32": {
-				id:     "double",
-				update: bson.D{{"$currentDate", bson.D{{"v", int32(1)}}}},
-				err: &mongo.WriteError{
-					Code:    2,
-					Message: "int is not valid type for $currentDate. Please use a boolean ('true') or a $type expression ({$type: 'timestamp/date'}).",
-				},
-			},
-			"Timestamp": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{{"v", bson.D{{"$type", "timestamp"}}}}}},
-				expected: bson.D{{"_id", "double"}, {"v", nowTimestamp}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-				paths: []types.Path{types.NewPathFromString("v")},
-			},
-			"TimestampCapitalised": {
-				id:     "double",
-				update: bson.D{{"$currentDate", bson.D{{"v", bson.D{{"$type", "Timestamp"}}}}}},
-				err: &mongo.WriteError{
-					Code:    2,
-					Message: "The '$type' string field is required to be 'date' or 'timestamp': {$currentDate: {field : {$type: 'date'}}}",
-				},
-				alt: "The '$type' string field is required to be 'date' or 'timestamp'",
-			},
-			"Date": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{{"v", bson.D{{"$type", "date"}}}}}},
-				expected: bson.D{{"_id", "double"}, {"v", now}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-				paths: []types.Path{types.NewPathFromString("v")},
-			},
-			"WrongType": {
-				id:     "double",
-				update: bson.D{{"$currentDate", bson.D{{"v", bson.D{{"$type", bson.D{{"abcd", int32(1)}}}}}}}},
-				err: &mongo.WriteError{
-					Code:    2,
-					Message: "The '$type' string field is required to be 'date' or 'timestamp': {$currentDate: {field : {$type: 'date'}}}",
-				},
-				alt: "The '$type' string field is required to be 'date' or 'timestamp'",
-			},
-			"NoField": {
-				id:       "double",
-				update:   bson.D{{"$currentDate", bson.D{{"unexsistent", bson.D{{"$type", "date"}}}}}},
-				expected: bson.D{{"_id", "double"}, {"v", 42.13}, {"unexsistent", now}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-				paths: []types.Path{types.NewPathFromString("unexsistent")},
-			},
-			"UnrecognizedOption": {
-				id: "array",
-				update: bson.D{{
-					"$currentDate",
-					bson.D{{"v", bson.D{{"array", bson.D{{"unexsistent", bson.D{}}}}}}},
-				}},
-				err: &mongo.WriteError{
-					Code:    2,
-					Message: "Unrecognized $currentDate option: array",
-				},
-			},
-		} {
-			name, tc := name, tc
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-				ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-				res, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
-				if tc.err != nil {
-					require.Nil(t, tc.paths)
-					require.Nil(t, tc.stat)
-					AssertEqualAltWriteError(t, *tc.err, tc.alt, err)
-					return
-				}
-				require.NoError(t, err)
-				require.Equal(t, tc.stat, res)
-
-				var actualB bson.D
-				err = collection.FindOne(ctx, bson.D{{"_id", tc.id}}).Decode(&actualB)
-				require.NoError(t, err)
-
-				expected := ConvertDocument(t, tc.expected)
-				actual := ConvertDocument(t, actualB)
-
-				for _, path := range tc.paths {
-					testutil.CompareAndSetByPathTime(t, expected, actual, maxDifference, path)
-				}
-				assert.Equal(t, expected, actual)
-			})
-		}
-	})
-}
-
-func TestUpdateFieldInc(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-
-	t.Run("Ok", func(t *testing.T) {
-		t.Parallel()
-
-		for name, tc := range map[string]struct {
-			id       string
-			update   bson.D
-			expected bson.D
-			stat     *mongo.UpdateResult
-		}{
-			"DoubleIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", float64(42.13)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(84.26)}},
-			},
-			"DoubleIncrementNaN": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", math.NaN()}}}},
-				expected: bson.D{{"_id", "double"}, {"v", math.NaN()}},
-			},
-			"DoubleIncrementPlusInfinity": {
-				id:       "double-nan",
-				update:   bson.D{{"$inc", bson.D{{"v", math.Inf(+1)}}}},
-				expected: bson.D{{"_id", "double-nan"}, {"v", math.NaN()}},
-			},
-			"DoubleNegativeIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", float64(-42.13)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(0)}},
-			},
-			"DoubleIncrementIntField": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"v", float64(1.13)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", float64(43.13)}},
-			},
-			"DoubleIncrementLongField": {
-				id:       "int64",
-				update:   bson.D{{"$inc", bson.D{{"v", float64(1.13)}}}},
-				expected: bson.D{{"_id", "int64"}, {"v", float64(43.13)}},
-			},
-			"DoubleIntIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(43.13)}},
-			},
-			"DoubleLongIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", int64(1)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(43.13)}},
-			},
-			"DoubleDoubleMaxIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", math.MaxFloat64}}}},
-				expected: bson.D{{"_id", "double"}, {"v", math.MaxFloat64}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleDoubleNaNIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", math.NaN()}}}},
-				expected: bson.D{{"_id", "double"}, {"v", math.NaN()}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleDoubleBigIncrement": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", float64(2 << 60)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(2 << 60)}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleBigDoubleIncrement": {
-				id:       "double-big",
-				update:   bson.D{{"$inc", bson.D{{"v", 42.13}}}},
-				expected: bson.D{{"_id", "double-big"}, {"v", float64(2 << 60)}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 0,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleMaxDoublePositiveIncrement": {
-				id:       "double-max",
-				update:   bson.D{{"$inc", bson.D{{"v", 42.13}}}},
-				expected: bson.D{{"_id", "double-max"}, {"v", math.MaxFloat64}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 0,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleMaxDoubleNegativeIncrement": {
-				id:       "double-max",
-				update:   bson.D{{"$inc", bson.D{{"v", -42.13}}}},
-				expected: bson.D{{"_id", "double-max"}, {"v", math.MaxFloat64}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 0,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleNaNDoublePositiveIncrement": {
-				id:       "double-nan",
-				update:   bson.D{{"$inc", bson.D{{"v", 42.13}}}},
-				expected: bson.D{{"_id", "double-nan"}, {"v", math.NaN()}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"DoubleNaNDoubleNegativeIncrement": {
-				id:       "double-nan",
-				update:   bson.D{{"$inc", bson.D{{"v", -42.13}}}},
-				expected: bson.D{{"_id", "double-nan"}, {"v", math.NaN()}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"IntIncrement": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", int32(43)}},
-			},
-			"IntNegativeIncrement": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"v", int32(-1)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", int32(41)}},
-			},
-			"IntIncrementDoubleField": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(43.13)}},
-			},
-			"IntIncrementLongField": {
-				id:       "int64",
-				update:   bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				expected: bson.D{{"_id", "int64"}, {"v", int64(43)}},
-			},
-			"LongIncrement": {
-				id:       "int64",
-				update:   bson.D{{"$inc", bson.D{{"v", int64(1)}}}},
-				expected: bson.D{{"_id", "int64"}, {"v", int64(43)}},
-			},
-			"LongNegativeIncrement": {
-				id:       "int64",
-				update:   bson.D{{"$inc", bson.D{{"v", int64(-1)}}}},
-				expected: bson.D{{"_id", "int64"}, {"v", int64(41)}},
-			},
-			"LongIncrementDoubleField": {
-				id:       "double",
-				update:   bson.D{{"$inc", bson.D{{"v", int64(1)}}}},
-				expected: bson.D{{"_id", "double"}, {"v", float64(43.13)}},
-			},
-			"LongIncrementIntField": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"v", int64(1)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", int64(43)}},
-			},
-
-			"FieldNotExist": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"foo", int32(1)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", int32(42)}, {"foo", int32(1)}},
-			},
-			"IncTwoFields": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"foo", int32(12)}, {"v", int32(1)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", int32(43)}, {"foo", int32(12)}},
-			},
-			"DotNotationDocumentFieldExist": {
-				id:       "document-composite",
-				update:   bson.D{{"$inc", bson.D{{"v.foo", int32(1)}}}},
-				expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(43)}, {"42", "foo"}, {"array", bson.A{int32(42), "foo", nil}}}}},
-			},
-			"DotNotationDocumentFieldNotExist": {
-				id:       "int32",
-				update:   bson.D{{"$inc", bson.D{{"foo.bar", int32(1)}}}},
-				expected: bson.D{{"_id", "int32"}, {"v", int32(42)}, {"foo", bson.D{{"bar", int32(1)}}}},
-			},
-			"DotNotationArrayFieldExist": {
-				id:       "document-composite",
-				update:   bson.D{{"$inc", bson.D{{"v.array.0", int32(1)}}}},
-				expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(42)}, {"42", "foo"}, {"array", bson.A{int32(43), "foo", nil}}}}},
-			},
-			"DotNotationArrayFieldNotExist": {
-				id:     "int32",
-				update: bson.D{{"$inc", bson.D{{"foo.0.baz", int32(1)}}}},
-				expected: bson.D{
-					{"_id", "int32"},
-					{"v", int32(42)},
-					{"foo", bson.D{{"0", bson.D{{"baz", int32(1)}}}}},
-				},
-			},
-			"DocumentDotNotationArrayFieldNotExist": {
-				id:     "document",
-				update: bson.D{{"$inc", bson.D{{"v.0.foo", int32(1)}}}},
-				expected: bson.D{
-					{"_id", "document"},
-					{"v", bson.D{{"foo", int32(42)}, {"0", bson.D{{"foo", int32(1)}}}}},
-				},
-			},
-		} {
-			name, tc := name, tc
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-				ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-				result, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
-				require.NoError(t, err)
-
-				if tc.stat != nil {
-					require.Equal(t, tc.stat, result)
-				}
-
-				var actual bson.D
-				err = collection.FindOne(ctx, bson.D{{"_id", tc.id}}).Decode(&actual)
-				require.NoError(t, err)
-
-				AssertEqualDocuments(t, tc.expected, actual)
-			})
-		}
-	})
-
-	t.Run("Err", func(t *testing.T) {
-		t.Parallel()
-
-		for name, tc := range map[string]struct {
-			id     string
-			update bson.D
-			err    *mongo.WriteError
-			alt    string
-		}{
-			"IncOnDocument": {
-				id:     "document",
-				update: bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				err: &mongo.WriteError{
-					Code: 14,
-					Message: `Cannot apply $inc to a value of non-numeric type. ` +
-						`{_id: "document"} has the field 'v' of non-numeric type object`,
-				},
-			},
-			"IncOnArray": {
-				id:     "array",
-				update: bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				err: &mongo.WriteError{
-					Code: 14,
-					Message: `Cannot apply $inc to a value of non-numeric type. ` +
-						`{_id: "array"} has the field 'v' of non-numeric type array`,
-				},
-			},
-			"IncOnString": {
-				id:     "string",
-				update: bson.D{{"$inc", "string"}},
-				err: &mongo.WriteError{
-					Code: 9,
-					Message: `Modifiers operate on fields but we found type string instead.` +
-						` For example: {$mod: {<field>: ...}} not {$inc: "string"}`,
-				},
-				alt: "Modifiers operate on fields but we found another type instead",
-			},
-			"IncWithStringValue": {
-				id:     "string",
-				update: bson.D{{"$inc", bson.D{{"v", "bad value"}}}},
-				err: &mongo.WriteError{
-					Code:    14,
-					Message: `Cannot increment with non-numeric argument: {v: "bad value"}`,
-				},
-			},
-			"DoubleIncOnNullValue": {
-				id:     "string",
-				update: bson.D{{"$inc", bson.D{{"v", float64(1)}}}},
-				err: &mongo.WriteError{
-					Code: 14,
-					Message: `Cannot apply $inc to a value of non-numeric type. ` +
-						`{_id: "string"} has the field 'v' of non-numeric type string`,
-				},
-			},
-			"IntIncOnNullValue": {
-				id:     "string",
-				update: bson.D{{"$inc", bson.D{{"v", int32(1)}}}},
-				err: &mongo.WriteError{
-					Code: 14,
-					Message: `Cannot apply $inc to a value of non-numeric type. ` +
-						`{_id: "string"} has the field 'v' of non-numeric type string`,
-				},
-			},
-			"LongIncOnNullValue": {
-				id:     "string",
-				update: bson.D{{"$inc", bson.D{{"v", int64(1)}}}},
-				err: &mongo.WriteError{
-					Code: 14,
-					Message: `Cannot apply $inc to a value of non-numeric type. ` +
-						`{_id: "string"} has the field 'v' of non-numeric type string`,
-				},
-			},
-			"ArrayDotNotationFieldNotExist": {
-				id:     "document-composite",
-				update: bson.D{{"$inc", bson.D{{"v.array.foo", int32(1)}}}},
-				err: &mongo.WriteError{
-					Code:    28,
-					Message: `Cannot create field 'foo' in element {array: [ 42, "foo", null ]}`,
-				},
-			},
-		} {
-			name, tc := name, tc
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-				ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-				_, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
-				require.NotNil(t, tc.err)
-				AssertEqualAltWriteError(t, *tc.err, tc.alt, err)
-			})
-		}
-	})
-}
-
 func TestUpdateFieldSet(t *testing.T) {
-	setup.SkipForTigris(t)
-
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
-		id       string
-		update   bson.D
-		expected bson.D
-		err      *mongo.WriteError
-		stat     *mongo.UpdateResult
-		alt      string
+		id     string // optional, defaults to empty
+		update bson.D // required, used for update parameter
+
+		res     *mongo.UpdateResult // optional, expected response from update
+		findRes bson.D              // optional, expected response from find
 	}{
-		"Many": {
-			id:       "string",
-			update:   bson.D{{"$set", bson.D{{"foo", int32(1)}, {"bar", bson.A{}}}}},
-			expected: bson.D{{"_id", "string"}, {"v", "foo"}, {"bar", bson.A{}}, {"foo", int32(1)}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"NilOperand": {
-			id:     "string",
-			update: bson.D{{"$set", nil}},
-			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type null instead. " +
-					"For example: {$mod: {<field>: ...}} not {$set: null}",
-			},
-			alt: "Modifiers operate on fields but we found another type instead",
-		},
-		"String": {
-			id:     "string",
-			update: bson.D{{"$set", "string"}},
-			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type string instead. " +
-					"For example: {$mod: {<field>: ...}} not {$set: \"string\"}",
-			},
-			alt: "Modifiers operate on fields but we found another type instead",
-		},
-		"Array": {
-			id:     "string",
-			update: bson.D{{"$set", bson.A{}}},
-			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type array instead. " +
-					"For example: {$mod: {<field>: ...}} not {$set: []}",
-			},
-			alt: "Modifiers operate on fields but we found another type instead",
-		},
-		"EmptyDoc": {
-			id:       "string",
-			update:   bson.D{{"$set", bson.D{}}},
-			expected: bson.D{{"_id", "string"}, {"v", "foo"}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
-		},
-		"OkSetString": {
-			id:       "string",
-			update:   bson.D{{"$set", bson.D{{"v", "ok value"}}}},
-			expected: bson.D{{"_id", "string"}, {"v", "ok value"}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
 		"ArrayNil": {
-			id:       "string",
-			update:   bson.D{{"$set", bson.D{{"v", bson.A{nil}}}}},
-			expected: bson.D{{"_id", "string"}, {"v", bson.A{nil}}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"FieldNotExist": {
-			id:       "string",
-			update:   bson.D{{"$set", bson.D{{"foo", int32(1)}}}},
-			expected: bson.D{{"_id", "string"}, {"v", "foo"}, {"foo", int32(1)}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"Double": {
-			id:       "double",
-			update:   bson.D{{"$set", bson.D{{"v", float64(1)}}}},
-			expected: bson.D{{"_id", "double"}, {"v", float64(1)}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"NaN": {
-			id:       "double",
-			update:   bson.D{{"$set", bson.D{{"v", math.NaN()}}}},
-			expected: bson.D{{"_id", "double"}, {"v", math.NaN()}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"EmptyArray": {
-			id:       "double",
-			update:   bson.D{{"$set", bson.D{{"v", bson.A{}}}}},
-			expected: bson.D{{"_id", "double"}, {"v", bson.A{}}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"Null": {
-			id:       "double",
-			update:   bson.D{{"$set", bson.D{{"v", nil}}}},
-			expected: bson.D{{"_id", "double"}, {"v", nil}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"Int32": {
-			id:       "double",
-			update:   bson.D{{"$set", bson.D{{"v", int32(1)}}}},
-			expected: bson.D{{"_id", "double"}, {"v", int32(1)}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"SetTwoFields": {
-			id:       "int32-zero",
-			update:   bson.D{{"$set", bson.D{{"foo", int32(12)}, {"v", math.NaN()}}}},
-			expected: bson.D{{"_id", "int32-zero"}, {"v", math.NaN()}, {"foo", int32(12)}},
-			stat: &mongo.UpdateResult{
+			id:      "string",
+			update:  bson.D{{"$set", bson.D{{"v", bson.A{nil}}}}},
+			findRes: bson.D{{"_id", "string"}, {"v", bson.A{nil}}},
+			res: &mongo.UpdateResult{
 				MatchedCount:  1,
 				ModifiedCount: 1,
 				UpsertedCount: 0,
 			},
 		},
 		"SetSameValueInt": {
-			id:       "int32",
-			update:   bson.D{{"$set", bson.D{{"v", int32(42)}}}},
-			expected: bson.D{{"_id", "int32"}, {"v", int32(42)}},
-			stat: &mongo.UpdateResult{
+			id:      "int32",
+			update:  bson.D{{"$set", bson.D{{"v", int32(42)}}}},
+			findRes: bson.D{{"_id", "int32"}, {"v", int32(42)}},
+			res: &mongo.UpdateResult{
 				MatchedCount:  1,
 				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
-		},
-		"SetSameValueNan": {
-			id:       "double-nan",
-			update:   bson.D{{"$set", bson.D{{"v", math.NaN()}}}},
-			expected: bson.D{{"_id", "double-nan"}, {"v", math.NaN()}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
-		},
-		"DotNotationDocumentFieldExist": {
-			id:       "document-composite",
-			update:   bson.D{{"$set", bson.D{{"v.foo", int32(1)}}}},
-			expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(1)}, {"42", "foo"}, {"array", bson.A{int32(42), "foo", nil}}}}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"DotNotationDocumentFieldNotExist": {
-			id:       "int32",
-			update:   bson.D{{"$set", bson.D{{"foo.bar", int32(1)}}}},
-			expected: bson.D{{"_id", "int32"}, {"v", int32(42)}, {"foo", bson.D{{"bar", int32(1)}}}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"DotNotationArrayFieldExist": {
-			id:       "document-composite",
-			update:   bson.D{{"$set", bson.D{{"v.array.0", int32(1)}}}},
-			expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(42)}, {"42", "foo"}, {"array", bson.A{int32(1), "foo", nil}}}}},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"DotNotationArrayFieldNotExist": {
-			id:     "int32",
-			update: bson.D{{"$set", bson.D{{"foo.0.baz", int32(1)}}}},
-			expected: bson.D{
-				{"_id", "int32"},
-				{"v", int32(42)},
-				{"foo", bson.D{{"0", bson.D{{"baz", int32(1)}}}}},
-			},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
-			},
-		},
-		"DocumentDotNotationArrayFieldNotExist": {
-			id:     "document",
-			update: bson.D{{"$set", bson.D{{"v.0.foo", int32(1)}}}},
-			expected: bson.D{
-				{"_id", "document"},
-				{"v", bson.D{{"foo", int32(42)}, {"0", bson.D{{"foo", int32(1)}}}}},
-			},
-			stat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
 				UpsertedCount: 0,
 			},
 		},
 	} {
-		name, tc := name, tc
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+
+			require.NotNil(t, tc.update, "update should be set")
+
 			ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
 
 			res, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
-			if tc.err != nil {
-				require.Nil(t, tc.expected)
-				AssertEqualAltWriteError(t, *tc.err, tc.alt, err)
-				return
-			}
 
 			require.NoError(t, err)
-			require.Equal(t, tc.stat, res)
+			require.Equal(t, tc.res, res)
 
 			var actual bson.D
 			err = collection.FindOne(ctx, bson.D{{"_id", tc.id}}).Decode(&actual)
 			require.NoError(t, err)
-			AssertEqualDocuments(t, tc.expected, actual)
+			AssertEqualDocuments(t, tc.findRes, actual)
 		})
 	}
 }
 
-func TestUpdateFieldSetOnInsert(t *testing.T) {
-	setup.SkipForTigris(t)
-
+// TestUpdateFieldSetIDDoc checks that the order of fields in the _id document matters.
+func TestUpdateFieldSetIDDoc(t *testing.T) {
 	t.Parallel()
 
-	for name, tc := range map[string]struct {
-		id           string
-		update       bson.D
-		expected     bson.D
-		err          *mongo.WriteError
-		alt          string
-		expectedStat *mongo.UpdateResult
-		upserted     bool
+	ctx, collection := setup.Setup(t)
+
+	_, err := collection.InsertOne(ctx, bson.D{
+		{"_id", bson.D{{"a", int32(1)}, {"z", int32(2)}}},
+		{"v", int32(1)},
+	})
+	require.NoError(t, err)
+	_, err = collection.InsertOne(ctx, bson.D{
+		{"_id", bson.D{{"a", int32(3)}, {"z", int32(4)}}},
+		{"v", int32(2)},
+	})
+	require.NoError(t, err)
+
+	res, err := collection.UpdateByID(
+		ctx,
+		bson.D{{"a", int32(3)}, {"z", int32(4)}},
+		bson.D{{"$set", bson.D{{"v", int32(3)}}}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}, res)
+
+	expected := []bson.D{{
+		{"_id", bson.D{{"a", int32(1)}, {"z", int32(2)}}},
+		{"v", int32(1)},
+	}, {
+		{"_id", bson.D{{"a", int32(3)}, {"z", int32(4)}}},
+		{"v", int32(3)},
+	}}
+	AssertEqualDocumentsSlice(t, expected, FindAll(t, ctx, collection))
+
+	res, err = collection.UpdateByID(
+		ctx,
+		bson.D{{"z", int32(4)}, {"a", int32(3)}},
+		bson.D{{"$set", bson.D{{"v", int32(4)}}}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, new(mongo.UpdateResult), res)
+
+	AssertEqualDocumentsSlice(t, expected, FindAll(t, ctx, collection))
+}
+
+func TestUpdateFieldSetUpdateManyUpsert(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct { //nolint:vet // used for testing only
+		filter bson.D                 // optional, defaults to bson.D{}
+		update bson.D                 // required, used for update parameter
+		opts   *options.UpdateOptions // optional
+
+		findRes []bson.E // required, expected response from find without _id generated by upsert
+		skip    string   // optional, skip test with a specified reason
 	}{
-		"Array": {
-			id:       "array-set-on-insert",
-			update:   bson.D{{"$setOnInsert", bson.D{{"v", bson.A{}}}}},
-			expected: bson.D{{"_id", "array-set-on-insert"}, {"v", bson.A{}}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  0,
-				ModifiedCount: 0,
-				UpsertedCount: 1,
-			},
-			upserted: true,
+		"QueryOperator": {
+			filter:  bson.D{{"v", bson.D{{"$lt", 3}}}},
+			update:  bson.D{{"$set", bson.D{{"new", "val"}}}},
+			opts:    options.Update().SetUpsert(true),
+			findRes: []bson.E{{"new", "val"}},
 		},
-		"Nil": {
-			id:       "nil",
-			update:   bson.D{{"$setOnInsert", bson.D{{"v", nil}}}},
-			expected: bson.D{{"_id", "nil"}, {"v", nil}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  0,
-				ModifiedCount: 0,
-				UpsertedCount: 1,
-			},
-			upserted: true,
+		"NoQueryOperator": {
+			filter:  bson.D{{"v", int32(4080)}},
+			update:  bson.D{{"$set", bson.D{{"new", "val"}}}},
+			opts:    options.Update().SetUpsert(true),
+			findRes: []bson.E{{"v", int32(4080)}, {"new", "val"}},
 		},
-		"EmptyDoc": {
-			id:       "doc",
-			update:   bson.D{{"$setOnInsert", bson.D{}}},
-			expected: bson.D{{"_id", "doc"}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  0,
-				ModifiedCount: 0,
-				UpsertedCount: 1,
-			},
-			upserted: true,
+		"QueryOperatorIDQuery": {
+			filter:  bson.D{{"_id", bson.D{{"$eq", 1}}}},
+			update:  bson.D{{"$set", bson.D{{"new", "val"}}}},
+			opts:    options.Update().SetUpsert(true),
+			findRes: []bson.E{{"new", "val"}},
 		},
-		"EmptyArray": {
-			id:     "array",
-			update: bson.D{{"$setOnInsert", bson.A{}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			require.NotNil(t, tc.update, "update should be set")
+			require.NotNil(t, tc.findRes, "findRes should be set")
+
+			ctx, collection := setup.Setup(t, shareddata.Nulls)
+
+			updateRes, err := collection.UpdateMany(ctx, tc.filter, tc.update, tc.opts)
+			require.NoError(t, err)
+			assert.Equal(t, int64(0), updateRes.MatchedCount)
+			assert.Equal(t, int64(0), updateRes.ModifiedCount)
+			assert.Equal(t, int64(1), updateRes.UpsertedCount)
+			require.NotNil(t, updateRes.UpsertedID)
+
+			cursor, err := collection.Find(ctx, bson.D{{"_id", updateRes.UpsertedID}})
+			require.NoError(t, err)
+
+			var res []bson.D
+			err = cursor.All(ctx, &res)
+			require.NoError(t, err)
+
+			expected := bson.D{{"_id", updateRes.UpsertedID}}
+			for _, e := range tc.findRes {
+				expected = append(expected, e)
+			}
+
+			AssertEqualDocumentsSlice(t, []bson.D{expected}, res)
+		})
+	}
+}
+
+func TestUpdateCommandUpsert(tt *testing.T) {
+	tt.Parallel()
+
+	for name, tc := range map[string]struct { //nolint:vet // used for testing only
+		updates bson.A // required, used for update parameter
+
+		updateRes bson.D
+		findRes   []bson.D          // required, expected response from find without _id generated by upsert
+		err       *mongo.WriteError // optional, expected error from MongoDB
+
+		skip             string // optional, skip test with a specified reason
+		failsForFerretDB string
+	}{
+		"NoUpdateOperator": {
+			updates: bson.A{
+				bson.D{
+					{"q", bson.D{{"v", bson.D{{"$lt", 3}}}}},
+					{"u", bson.D{{"updateV", "val"}}},
+					{"upsert", true},
+				},
+			},
+			updateRes: bson.D{
+				{"n", int32(1)},
+				{"upserted", bson.A{
+					bson.D{{"index", int32(0)}, {"_id", primitive.ObjectID{}}},
+				}},
+				{"nModified", int32(0)},
+				{"ok", float64(1)},
+			},
+
+			findRes: []bson.D{{{"_id", ""}, {"v", nil}}, {{"_id", primitive.ObjectID{}}, {"updateV", "val"}}},
+		},
+		"NoUpdateOperatorEmptyQuery": {
+			updates: bson.A{
+				bson.D{
+					{"q", bson.D{}},
+					{"u", bson.D{{"updateV", "val"}}},
+					{"upsert", true},
+				},
+			},
+			updateRes: bson.D{
+				{"n", int32(1)},
+				{"nModified", int32(1)},
+				{"ok", float64(1)},
+			},
+			findRes: []bson.D{{{"_id", ""}, {"updateV", "val"}}},
+		},
+		"NoQueryOperator": {
+			updates: bson.A{
+				bson.D{
+					{"q", bson.D{{"queryV", "v"}}},
+					{"u", bson.D{{"$set", bson.D{{"updateV", "val"}}}}},
+					{"upsert", true},
+				},
+			},
+			updateRes: bson.D{
+				{"n", int32(1)},
+				{"upserted", bson.A{
+					bson.D{{"index", int32(0)}, {"_id", primitive.ObjectID{}}},
+				}},
+				{"nModified", int32(0)},
+				{"ok", float64(1)},
+			},
+			findRes: []bson.D{{{"_id", ""}, {"v", nil}}, {{"_id", primitive.ObjectID{}}, {"queryV", "v"}, {"updateV", "val"}}},
+		},
+		"NoUpdateOperatorNoQueryOperator": {
+			updates: bson.A{
+				bson.D{
+					{"q", bson.D{{"queryV", "val"}}},
+					{"u", bson.D{{"updateV", "val"}}},
+					{"upsert", true},
+				},
+			},
+			updateRes: bson.D{
+				{"n", int32(1)},
+				{"upserted", bson.A{
+					bson.D{{"index", int32(0)}, {"_id", primitive.ObjectID{}}},
+				}},
+				{"nModified", int32(0)},
+				{"ok", float64(1)},
+			},
+			findRes: []bson.D{{{"_id", ""}, {"v", nil}}, {{"_id", primitive.ObjectID{}}, {"updateV", "val"}}},
+		},
+		"MultipleUpserts": {
+			updates: bson.A{
+				bson.D{
+					{"q", bson.D{{"v", bson.D{{"$gt", 3}}}}},
+					{"u", bson.D{{"updateV", "greater"}}},
+					{"upsert", true},
+				},
+				bson.D{
+					{"q", bson.D{{"v", bson.D{{"$lt", 3}}}}},
+					{"u", bson.D{{"updateV", "less"}}},
+					{"upsert", true},
+				},
+			},
+			updateRes: bson.D{
+				{"n", int32(2)},
+				{"upserted", bson.A{
+					bson.D{{"index", int32(0)}, {"_id", primitive.ObjectID{}}},
+					bson.D{{"index", int32(1)}, {"_id", primitive.ObjectID{}}},
+				}},
+				{"nModified", int32(0)},
+				{"ok", float64(1)},
+			},
+			findRes: []bson.D{
+				{{"_id", ""}, {"v", nil}},
+				{{"_id", primitive.ObjectID{}}, {"updateV", "greater"}},
+				{{"_id", primitive.ObjectID{}}, {"updateV", "less"}},
+			},
+		},
+		"UnknownUpdateOperator": {
+			updates: bson.A{
+				bson.D{
+					{"q", bson.D{{"v", bson.D{{"$lt", 3}}}}},
+					{"u", bson.D{{"$unknown", bson.D{{"v", "val"}}}}},
+					{"upsert", true},
+				},
+			},
 			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type array instead. " +
-					"For example: {$mod: {<field>: ...}} not {$setOnInsert: []}",
+				Code:    9,
+				Message: "Unknown modifier: $unknown. Expected a valid update modifier or pipeline-style update specified as an array",
 			},
-			alt: "Modifiers operate on fields but we found another type instead",
 		},
-		"DoubleDouble": {
-			id:     "double",
-			update: bson.D{{"$setOnInsert", 43.13}},
+	} {
+		tt.Run(name, func(tt *testing.T) {
+			tt.Parallel()
+
+			require.NotNil(tt, tc.updates, "update should be set")
+
+			ctx, collection := setup.Setup(tt, shareddata.Nulls)
+
+			var t testing.TB = tt
+
+			if tc.failsForFerretDB != "" {
+				t = setup.FailsForFerretDB(tt, tc.failsForFerretDB)
+			}
+
+			var res bson.D
+			err := collection.Database().RunCommand(ctx,
+				bson.D{
+					{"update", collection.Name()},
+					{"updates", tc.updates},
+				}).Decode(&res)
+
+			if tc.err != nil {
+				assert.Nil(t, res)
+				AssertEqualWriteError(t, *tc.err, err)
+
+				return
+			}
+
+			var actualComparable bson.D
+
+			for _, field := range res {
+				switch field.Key {
+				case "upserted":
+					require.IsType(t, bson.A{}, field.Value)
+					upserted := field.Value.(bson.A)
+
+					var actualComparableUpserted bson.A
+
+					for _, field := range upserted {
+						var actualElem bson.D
+
+						require.IsType(t, bson.D{}, field)
+						upsertedElem := field.(bson.D)
+
+						for _, field := range upsertedElem {
+							switch field.Key {
+							case "_id":
+								// _id is generated, cannot check for exact value so check it is not zero value
+								assert.IsType(t, primitive.ObjectID{}, field.Value)
+								actualElem = append(actualElem, bson.E{"_id", primitive.ObjectID{}})
+							default:
+								actualElem = append(actualElem, field)
+							}
+						}
+
+						actualComparableUpserted = append(actualComparableUpserted, actualElem)
+					}
+
+					actualComparable = append(actualComparable, bson.E{"upserted", actualComparableUpserted})
+
+				default:
+					actualComparable = append(actualComparable, field)
+				}
+			}
+
+			AssertEqualDocuments(t, tc.updateRes, actualComparable)
+
+			cursor, err := collection.Find(ctx, bson.D{}, options.Find().SetSort(bson.D{{"v", 1}, {"_id", 1}}))
+			require.NoError(t, err)
+
+			var findRes []bson.D
+			err = cursor.All(ctx, &findRes)
+			require.NoError(t, err)
+
+			var actualComparableFind []bson.D
+
+			for _, doc := range findRes {
+				var comparableDoc bson.D
+
+				for _, elem := range doc {
+					switch elem.Key {
+					case "_id":
+						switch elem.Value.(type) {
+						case string:
+							comparableDoc = append(comparableDoc, bson.E{"_id", ""})
+						case primitive.ObjectID:
+							comparableDoc = append(comparableDoc, bson.E{"_id", primitive.ObjectID{}})
+						default:
+							require.Fail(tt, "The _id field should be of a string type or primitive.ObjectID")
+						}
+					default:
+						comparableDoc = append(comparableDoc, elem)
+					}
+				}
+
+				actualComparableFind = append(actualComparableFind, comparableDoc)
+			}
+
+			AssertEqualDocumentsSlice(t, tc.findRes, actualComparableFind)
+		})
+	}
+}
+
+func TestUpdateFieldErrors(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct { //nolint:vet // it is used for test only
+		id       string              // optional, defaults to empty
+		update   bson.D              // required, used for update parameter
+		provider shareddata.Provider // optional, default uses shareddata.ArrayDocuments
+
+		err              *mongo.WriteError // required, expected error from MongoDB
+		altMessage       string            // optional, alternative error message for FerretDB, ignored if empty
+		failsForFerretDB string
+	}{
+		"SetUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$rename", bson.D{{"v.foo", "foo"}}}},
 			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type double instead. " +
-					"For example: {$mod: {<field>: ...}} not {$setOnInsert: 43.13}",
+				Code: 28,
+				Message: "cannot use the part (v of v.foo) to traverse the element " +
+					"({v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]})",
 			},
-			alt: "Modifiers operate on fields but we found another type instead",
+			altMessage:       "cannot use path 'v.foo' to traverse the document",
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
 		},
-		"ErrNaN": {
-			id:     "double-nan",
-			update: bson.D{{"$setOnInsert", math.NaN()}},
+		"SetImmutableID": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$set", bson.D{{"_id", "another-id"}}}},
 			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type double instead. " +
-					"For example: {$mod: {<field>: ...}} not {$setOnInsert: nan.0}",
+				Code:    66,
+				Message: "Performing an update on the path '_id' would modify the immutable field '_id'",
 			},
-			alt: "Modifiers operate on fields but we found another type instead",
 		},
-		"ErrString": {
-			id:     "string",
-			update: bson.D{{"$setOnInsert", "any string"}},
+		"RenameEmptyFieldName": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$rename", bson.D{{"", "v"}}}},
+			err: &mongo.WriteError{
+				Code:    56,
+				Message: "An empty update path is not valid.",
+			},
+			altMessage: "An empty update path is not valid",
+		},
+		"RenameEmptyPath": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$rename", bson.D{{"v.", "v"}}}},
+			err: &mongo.WriteError{
+				Code:    56,
+				Message: "The update path 'v.' contains an empty field name, which is not allowed.",
+			},
+			altMessage: "An update path 'v.' contains an empty field name, which is not allowed.",
+		},
+		"RenameArrayInvalidIndex": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$rename", bson.D{{"v.-1", "f"}}}},
+			err: &mongo.WriteError{
+				Code: 28,
+				Message: "cannot use the part (v of v.-1) to traverse the element " +
+					"({v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]})",
+			},
+			altMessage:       "cannot use path 'v.-1' to traverse the document",
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
+		},
+		"RenameUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$rename", bson.D{{"v.0.foo.0.bar.z", "f"}}}},
+			err: &mongo.WriteError{
+				Code:    28,
+				Message: "cannot use the part (bar of v.0.foo.0.bar.z) to traverse the element ({bar: \"hello\"})",
+			},
+			altMessage: "Cannot create field 'bar' in element {bar : \"hello\"}",
+		},
+		"IncTypeMismatch": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$inc", bson.D{{"v", "string"}}}},
+			err: &mongo.WriteError{
+				Code:    14,
+				Message: "Cannot increment with non-numeric argument: {v: \"string\"}",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/431",
+		},
+		"IncUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$inc", bson.D{{"v.foo", 1}}}},
+			err: &mongo.WriteError{
+				Code: 28,
+				Message: "Cannot create field 'foo' in element " +
+					"{v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]}",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
+		},
+		"IncNonNumeric": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$inc", bson.D{{"v.0.foo.0.bar", 1}}}},
+			err: &mongo.WriteError{
+				Code: 14,
+				Message: "Cannot apply $inc to a value of non-numeric type. " +
+					"{_id: \"array-documents-nested\"} has the field 'bar' of non-numeric type string",
+			},
+			altMessage: "Cannot apply $inc to a value of non-numeric type. { _id: \"array-documents-nested\" } " +
+				"has the field 'bar' of non-numeric type string",
+		},
+		"IncInt64BadValue": {
+			id:     "int64-max",
+			update: bson.D{{"$inc", bson.D{{"v", math.MaxInt64}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "Failed to apply $inc operations to current value " +
+					"((NumberLong)9223372036854775807) for document {_id: \"int64-max\"}",
+			},
+			provider: shareddata.Int64s,
+		},
+		"IncInt32BadValue": {
+			id:     "int32",
+			update: bson.D{{"$inc", bson.D{{"v", math.MaxInt64}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "Failed to apply $inc operations to current value " +
+					"((NumberInt)42) for document {_id: \"int32\"}",
+			},
+			provider: shareddata.Int32s,
+		},
+		"MaxUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$max", bson.D{{"v.foo", 1}}}},
+			err: &mongo.WriteError{
+				Code: 28,
+				Message: "Cannot create field 'foo' in element " +
+					"{v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]}",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
+		},
+		"MinUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$min", bson.D{{"v.foo", 1}}}},
+			err: &mongo.WriteError{
+				Code: 28,
+				Message: "Cannot create field 'foo' in element " +
+					"{v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]}",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
+		},
+		"MulTypeMismatch": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$mul", bson.D{{"v", "string"}}}},
+			err: &mongo.WriteError{
+				Code:    14,
+				Message: "Cannot multiply with non-numeric argument: {v: \"string\"}",
+			},
+			altMessage: "Cannot multiply with non-numeric argument: { v : \"string\" }",
+		},
+		"MulTypeMismatchNonExistent": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$mul", bson.D{{"non-existent", "string"}}}},
+			err: &mongo.WriteError{
+				Code:    14,
+				Message: "Cannot multiply with non-numeric argument: {non-existent: \"string\"}",
+			},
+			altMessage: "Cannot multiply with non-numeric argument: { non-existent : \"string\" }",
+		},
+		"MulUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$mul", bson.D{{"v.foo", 1}}}},
+			err: &mongo.WriteError{
+				Code: 28,
+				Message: "Cannot create field 'foo' in element " +
+					"{v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]}",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
+		},
+		"MulNonNumeric": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$mul", bson.D{{"v.0.foo.0.bar", 1}}}},
+			err: &mongo.WriteError{
+				Code: 14,
+				Message: "Cannot apply $mul to a value of non-numeric type. " +
+					"{_id: \"array-documents-nested\"} has the field 'bar' of non-numeric type string",
+			},
+			altMessage: "Cannot apply $mul to a value of non-numeric type. { _id: \"array-documents-nested\" } " +
+				"has the field 'bar' of non-numeric type string",
+		},
+		"MulInt64BadValue": {
+			id:     "int64-max",
+			update: bson.D{{"$mul", bson.D{{"v", math.MaxInt64}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "Failed to apply $mul operations to current value " +
+					"((NumberLong)9223372036854775807) for document {_id: \"int64-max\"}",
+			},
+			provider:   shareddata.Int64s,
+			altMessage: "Failed to apply $mul operations to current ((NumberLong)9223372036854775807) value for document { _id: \"int64-max\" }",
+		},
+		"MulInt32BadValue": {
+			id:     "int32",
+			update: bson.D{{"$mul", bson.D{{"v", math.MaxInt64}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "Failed to apply $mul operations to current value " +
+					"((NumberInt)42) for document {_id: \"int32\"}",
+			},
+			provider:   shareddata.Int32s,
+			altMessage: "Failed to apply $mul operations to current ((NumberInt)42) value for document { _id: \"int32\" }",
+		},
+		"MulEmptyPath": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$mul", bson.D{{"v.", "v"}}}},
+			err: &mongo.WriteError{
+				Code:    56,
+				Message: "The update path 'v.' contains an empty field name, which is not allowed.",
+			},
+			altMessage: "An update path 'v.' contains an empty field name, which is not allowed.",
+		},
+		"BitUnsupportedOperator": {
+			id: "int32",
+			update: bson.D{
+				{"$bit", bson.D{{"v", bson.D{{"not", 1}}}}},
+			},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "The $bit modifier only supports 'and', 'or', and 'xor', not 'not' " +
+					"which is an unknown operator: {not: 1}",
+			},
+			provider:   shareddata.Int32s,
+			altMessage: "The $bit modifier only supports 'and', 'or', and 'xor', not 'not' which is an unknown operator: { \"not\" : 1 }",
+		},
+		"BitEmptyFieldPath": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$bit", bson.D{{"v.", bson.D{{"and", 1}}}}}},
+			err: &mongo.WriteError{
+				Code:    56,
+				Message: "The update path 'v.' contains an empty field name, which is not allowed.",
+			},
+			altMessage: "An update path 'v.' contains an empty field name, which is not allowed.",
+		},
+		"BitEmptyOperation": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$bit", bson.D{{"v", bson.D{}}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "You must pass in at least one bitwise operation. " +
+					"The format is: {$bit: {field: {and/or/xor: #}}",
+			},
+		},
+		"BitUnsuitableValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$bit", bson.D{{"v.foo", bson.D{{"or", 1}}}}}},
+			err: &mongo.WriteError{
+				Code: 28,
+				Message: "Cannot create field 'foo' in element " +
+					"{v: [ { foo: [ { bar: \"hello\" }, { bar: \"world\" } ] } ]}",
+			},
+			failsForFerretDB: "https://github.com/FerretDB/FerretDB-DocumentDB/issues/429",
+		},
+		"BitNonIntegralDocValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$bit", bson.D{{"v.0.foo", bson.D{{"and", 1}}}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "Cannot apply $bit to a value of non-integral type." +
+					"_id: \"array-documents-nested\" has the field foo of non-integer type array",
+			},
+			altMessage: "Cannot apply $bit to a value of non-integral type.{ \"_id\" : \"array-documents-nested\" } " +
+				"has the field foo of non-integer type array",
+		},
+		"BitIncompatibleOperatorValue": {
+			id:     "array-documents-nested",
+			update: bson.D{{"$bit", "string"}},
 			err: &mongo.WriteError{
 				Code: 9,
 				Message: "Modifiers operate on fields but we found type string instead. " +
-					"For example: {$mod: {<field>: ...}} not {$setOnInsert: \"any string\"}",
-			},
-			alt: "Modifiers operate on fields but we found another type instead",
-		},
-		"ErrNil": {
-			id:     "nil",
-			update: bson.D{{"$setOnInsert", nil}},
-			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type null instead. " +
-					"For example: {$mod: {<field>: ...}} not {$setOnInsert: null}",
-			},
-			alt: "Modifiers operate on fields but we found another type instead",
-		},
-		"DotNotationDocumentFieldExist": {
-			id:       "document-composite",
-			update:   bson.D{{"$set", bson.D{{"v.foo", int32(1)}}}},
-			expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(1)}, {"42", "foo"}, {"array", bson.A{int32(42), "foo", nil}}}}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 1,
-				UpsertedCount: 0,
+					"For example: {$mod: {<field>: ...}} not {$bit: \"string\"}",
 			},
 		},
-		"DotNotationDocumentFieldNotExist": {
-			id:       "int32",
-			update:   bson.D{{"$setOnInsert", bson.D{{"foo.bar", int32(1)}}}},
-			expected: bson.D{{"_id", "int32"}, {"v", int32(42)}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
-		},
-		"DotNotationArrayFieldExist": {
-			id:       "document-composite",
-			update:   bson.D{{"$setOnInsert", bson.D{{"v.array.0", int32(1)}}}},
-			expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(42)}, {"42", "foo"}, {"array", bson.A{int32(42), "foo", nil}}}}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
-		},
-		"DotNotationArrFieldNotExist": {
+		"BitEmbeddedDocBadValue": {
 			id:     "int32",
-			update: bson.D{{"$setOnInsert", bson.D{{"foo.0.baz", int32(1)}}}},
-			expected: bson.D{
-				{"_id", "int32"},
-				{"v", int32(42)},
+			update: bson.D{{"$bit", bson.D{{"test", "and"}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "The $bit modifier is not compatible with a string. " +
+					"You must pass in an embedded document: {$bit: {field: {and/or/xor: #}}",
 			},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
+			provider:   shareddata.Int32s,
+			altMessage: "$bit should be a document",
 		},
-		"DocumentDotNotationArrFieldNotExist": {
-			id:     "document",
-			update: bson.D{{"$setOnInsert", bson.D{{"v.0.foo", int32(1)}}}},
-			expected: bson.D{
-				{"_id", "document"},
-				{"v", bson.D{{"foo", int32(42)}}},
+		"BitNonIntegralOperand": {
+			id:     "int32",
+			update: bson.D{{"$bit", bson.D{{"v", bson.D{{"and", "test"}}}}}},
+			err: &mongo.WriteError{
+				Code: 2,
+				Message: "The $bit modifier field must be an Integer(32/64 bit); " +
+					"a 'string' is not supported here: {and: \"test\"}",
 			},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
+			provider:   shareddata.Int32s,
+			altMessage: "The $bit modifier field must be an Integer(32/64 bit); a 'string' is not supported here: { \"and\" : \"test\" }",
 		},
 	} {
-		name, tc := name, tc
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+		t.Run(name, func(tt *testing.T) {
+			tt.Parallel()
 
-			ctx, collection := setup.Setup(t, shareddata.Composites, shareddata.Scalars)
-
-			opts := options.Update().SetUpsert(true)
-			actualUpdateStat, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update, opts)
-			if tc.err != nil {
-				require.Nil(t, tc.expected)
-				AssertEqualAltWriteError(t, *tc.err, tc.alt, err)
-				return
+			var t testing.TB = tt
+			if tc.failsForFerretDB != "" {
+				t = setup.FailsForFerretDB(tt, tc.failsForFerretDB)
 			}
 
-			require.NoError(t, err)
+			require.NotNil(t, tc.update, "update should be set")
+			require.NotNil(t, tc.err, "err should be set")
 
-			expectedStat := tc.expectedStat
-			if tc.upserted {
-				expectedStat.UpsertedID = tc.id
+			provider := tc.provider
+			if provider == nil {
+				provider = shareddata.ArrayDocuments
 			}
-			assert.Equal(t, expectedStat, actualUpdateStat)
 
-			var actual bson.D
-			err = collection.FindOne(ctx, bson.D{{"_id", tc.id}}).Decode(&actual)
-			require.NoError(t, err)
-			AssertEqualDocuments(t, tc.expected, actual)
+			ctx, collection := setup.Setup(tt, provider)
+
+			res, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
+
+			assert.Nil(t, res)
+			AssertEqualAltWriteError(t, *tc.err, tc.altMessage, err)
 		})
 	}
-}
-
-func TestUpdateFieldUnset(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-
-	for name, tc := range map[string]struct {
-		id           string
-		update       bson.D
-		expected     bson.D
-		expectedStat *mongo.UpdateResult
-		err          *mongo.WriteError
-		alt          string
-	}{
-		"Empty": {
-			id:       "string",
-			update:   bson.D{{"$unset", bson.D{}}},
-			expected: bson.D{{"_id", "string"}, {"v", "foo"}},
-			expectedStat: &mongo.UpdateResult{
-				MatchedCount:  1,
-				ModifiedCount: 0,
-				UpsertedCount: 0,
-			},
-		},
-		"EmptyArray": {
-			id:     "document-composite",
-			update: bson.D{{"$unset", bson.A{}}},
-			err: &mongo.WriteError{
-				Code: 9,
-				Message: "Modifiers operate on fields but we found type array instead. " +
-					"For example: {$mod: {<field>: ...}} not {$unset: []}",
-			},
-			alt: "Modifiers operate on fields but we found another type instead",
-		},
-	} {
-		name, tc := name, tc
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-			opts := options.Update().SetUpsert(true)
-			actualStat, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update, opts)
-
-			if tc.err != nil {
-				require.Nil(t, tc.expected)
-				AssertEqualAltWriteError(t, *tc.err, tc.alt, err)
-				return
-			}
-
-			require.NoError(t, err)
-			actualStat.UpsertedID = nil
-			assert.Equal(t, tc.expectedStat, actualStat)
-
-			var actual bson.D
-			err = collection.FindOne(ctx, bson.D{{"_id", tc.id}}).Decode(&actual)
-			require.NoError(t, err)
-			AssertEqualDocuments(t, tc.expected, actual)
-		})
-	}
-}
-
-func TestUpdateFieldMixed(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-
-	for name, tc := range map[string]struct {
-		filter   bson.D
-		update   bson.D
-		expected bson.D
-		err      *mongo.WriteError
-	}{
-		"SetSetOnInsert": {
-			filter: bson.D{{"_id", "test"}},
-			update: bson.D{
-				{"$set", bson.D{{"foo", int32(12)}}},
-				{"$setOnInsert", bson.D{{"v", math.NaN()}}},
-			},
-			expected: bson.D{{"_id", "test"}, {"foo", int32(12)}, {"v", math.NaN()}},
-		},
-		"SetIncSetOnInsert": {
-			filter: bson.D{{"_id", "test"}},
-			update: bson.D{
-				{"$set", bson.D{{"foo", int32(12)}}},
-				{"$inc", bson.D{{"foo", int32(1)}}},
-				{"$setOnInsert", bson.D{{"v", math.NaN()}}},
-			},
-			err: &mongo.WriteError{
-				Code:    40,
-				Message: "Updating the path 'foo' would create a conflict at 'foo'",
-			},
-		},
-		"UnknownOperator": {
-			filter: bson.D{{"_id", "test"}},
-			update: bson.D{{"$foo", bson.D{{"foo", int32(1)}}}},
-			err: &mongo.WriteError{
-				Code:    9,
-				Message: "Unknown modifier: $foo. Expected a valid update modifier or pipeline-style update specified as an array",
-			},
-		},
-	} {
-		name, tc := name, tc
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-			opts := options.Update().SetUpsert(true)
-			actualStat, err := collection.UpdateOne(ctx, tc.filter, tc.update, opts)
-
-			if tc.err != nil {
-				require.Nil(t, tc.expected)
-				AssertEqualWriteError(t, *tc.err, err)
-				return
-			}
-
-			require.NoError(t, err)
-			actualStat.UpsertedID = nil
-
-			expectedStat := &mongo.UpdateResult{
-				MatchedCount:  0,
-				ModifiedCount: 0,
-				UpsertedCount: 1,
-			}
-			assert.Equal(t, expectedStat, actualStat)
-
-			var actual bson.D
-			err = collection.FindOne(ctx, tc.filter).Decode(&actual)
-			require.NoError(t, err)
-			AssertEqualDocuments(t, tc.expected, actual)
-		})
-	}
-}
-
-func TestUpdateFieldPopArrayOperator(t *testing.T) {
-	setup.SkipForTigris(t)
-
-	t.Parallel()
-
-	t.Run("Ok", func(t *testing.T) {
-		t.Parallel()
-
-		for name, tc := range map[string]struct {
-			id       string
-			update   bson.D
-			expected bson.D
-			stat     *mongo.UpdateResult
-		}{
-			"Pop": {
-				id:       "array-three",
-				update:   bson.D{{"$pop", bson.D{{"v", 1}}}},
-				expected: bson.D{{"_id", "array-three"}, {"v", bson.A{int32(42), "foo"}}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"PopFirst": {
-				id:       "array-three",
-				update:   bson.D{{"$pop", bson.D{{"v", -1}}}},
-				expected: bson.D{{"_id", "array-three"}, {"v", bson.A{"foo", nil}}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"PopDotNotation": {
-				id:       "document-composite",
-				update:   bson.D{{"$pop", bson.D{{"v.array", 1}}}},
-				expected: bson.D{{"_id", "document-composite"}, {"v", bson.D{{"foo", int32(42)}, {"42", "foo"}, {"array", bson.A{int32(42), "foo"}}}}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 1,
-					UpsertedCount: 0,
-				},
-			},
-			"PopEmptyArray": {
-				id:       "array-empty",
-				update:   bson.D{{"$pop", bson.D{{"v", 1}}}},
-				expected: bson.D{{"_id", "array-empty"}, {"v", bson.A{}}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 0,
-					UpsertedCount: 0,
-				},
-			},
-			"PopNoSuchKey": {
-				id:       "array",
-				update:   bson.D{{"$pop", bson.D{{"foo", 1}}}},
-				expected: bson.D{{"_id", "array"}, {"v", bson.A{int32(42)}}},
-			},
-			"PopEmptyValue": {
-				id:       "array",
-				update:   bson.D{{"$pop", bson.D{}}},
-				expected: bson.D{{"_id", "array"}, {"v", bson.A{int32(42)}}},
-				stat: &mongo.UpdateResult{
-					MatchedCount:  1,
-					ModifiedCount: 0,
-					UpsertedCount: 0,
-				},
-			},
-		} {
-			name, tc := name, tc
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-				ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-				result, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
-				require.NoError(t, err)
-
-				if tc.stat != nil {
-					require.Equal(t, tc.stat, result)
-				}
-
-				var actual bson.D
-				err = collection.FindOne(ctx, bson.D{{"_id", tc.id}}).Decode(&actual)
-				require.NoError(t, err)
-
-				AssertEqualDocuments(t, tc.expected, actual)
-			})
-		}
-	})
-
-	t.Run("Err", func(t *testing.T) {
-		t.Parallel()
-
-		for name, tc := range map[string]struct {
-			id     string
-			update bson.D
-			err    *mongo.WriteError
-			alt    string
-		}{
-			"PopNotValidValueString": {
-				id:     "array",
-				update: bson.D{{"$pop", bson.D{{"v", "foo"}}}},
-				err: &mongo.WriteError{
-					Code:    9,
-					Message: "Expected a number in: v: \"foo\"",
-				},
-			},
-			"PopNotValidValueInt": {
-				id:     "array",
-				update: bson.D{{"$pop", bson.D{{"v", int32(42)}}}},
-				err: &mongo.WriteError{
-					Code:    9,
-					Message: "$pop expects 1 or -1, found: 42",
-				},
-			},
-			"PopOnNonArray": {
-				id:     "int32",
-				update: bson.D{{"$pop", bson.D{{"v", 1}}}},
-				err: &mongo.WriteError{
-					Code:    14,
-					Message: "Path 'v' contains an element of non-array type 'int'",
-				},
-			},
-			// TODO: https://github.com/FerretDB/FerretDB/issues/364
-			//"PopLastAndFirst": {
-			//	id:     "array-three",
-			//	update: bson.D{{"$pop", bson.D{{"v", 1}, {"v", -1}}}},
-			//	err: &mongo.WriteError{
-			//		Code:    40,
-			//		Message: "Updating the path 'v' would create a conflict at 'v'",
-			//	},
-			//},
-			"PopDotNotationNonArray": {
-				id:     "document-composite",
-				update: bson.D{{"$pop", bson.D{{"v.foo", 1}}}},
-				err: &mongo.WriteError{
-					Code:    14,
-					Message: "Path 'v.foo' contains an element of non-array type 'int'",
-				},
-			},
-		} {
-			name, tc := name, tc
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
-				ctx, collection := setup.Setup(t, shareddata.Scalars, shareddata.Composites)
-
-				_, err := collection.UpdateOne(ctx, bson.D{{"_id", tc.id}}, tc.update)
-				require.NotNil(t, tc.err)
-				AssertEqualAltWriteError(t, *tc.err, tc.alt, err)
-			})
-		}
-	})
-}
-
-// This test is to ensure that the order of fields in the document is preserved.
-func TestUpdateDocumentFieldsOrder(t *testing.T) {
-	setup.SkipForTigrisWithReason(t, "Tigris schema would fail this test")
-
-	ctx, collection := setup.Setup(t, shareddata.Composites)
-
-	_, err := collection.UpdateOne(
-		ctx,
-		bson.D{{"_id", "document"}},
-		bson.D{{"$set", bson.D{{"foo", int32(42)}, {"bar", "baz"}}}},
-	)
-	require.NoError(t, err)
-
-	var updated bson.D
-
-	err = collection.FindOne(ctx, bson.D{{"_id", "document"}}).Decode(&updated)
-	require.NoError(t, err)
-
-	expected := bson.D{
-		{"_id", "document"},
-		{"v", bson.D{{"foo", int32(42)}}},
-		{"bar", "baz"},
-		{"foo", int32(42)},
-	}
-
-	AssertEqualDocuments(t, expected, updated)
-
-	_, err = collection.UpdateOne(
-		ctx,
-		bson.D{{"_id", "document"}},
-		bson.D{{"$unset", bson.D{{"foo", ""}}}},
-	)
-	require.NoError(t, err)
-
-	err = collection.FindOne(ctx, bson.D{{"_id", "document"}}).Decode(&updated)
-	require.NoError(t, err)
-
-	expected = bson.D{
-		{"_id", "document"},
-		{"v", bson.D{{"foo", int32(42)}}},
-		{"bar", "baz"},
-	}
-
-	AssertEqualDocuments(t, expected, updated)
-
-	_, err = collection.UpdateOne(
-		ctx,
-		bson.D{{"_id", "document"}},
-		bson.D{{"$set", bson.D{{"abc", int32(42)}}}},
-	)
-	require.NoError(t, err)
-
-	err = collection.FindOne(ctx, bson.D{{"_id", "document"}}).Decode(&updated)
-	require.NoError(t, err)
-
-	expected = bson.D{
-		{"_id", "document"},
-		{"v", bson.D{{"foo", int32(42)}}},
-		{"bar", "baz"},
-		{"abc", int32(42)},
-	}
-
-	AssertEqualDocuments(t, expected, updated)
-}
-
-// This test is to ensure that the order of fields in the document is preserved.
-func TestUpdateDocumentFieldsOrderSimplified(t *testing.T) {
-	ctx, collection := setup.Setup(t)
-
-	_, err := collection.InsertOne(ctx, bson.D{{"_id", "document"}, {"foo", int32(42)}, {"bar", "baz"}})
-	require.NoError(t, err)
-
-	var inserted bson.D
-	err = collection.FindOne(ctx, bson.D{{"_id", "document"}}).Decode(&inserted)
-	require.NoError(t, err)
-
-	expected := bson.D{
-		{"_id", "document"},
-		{"foo", int32(42)},
-		{"bar", "baz"},
-	}
-	AssertEqualDocuments(t, expected, inserted)
-
-	_, err = collection.UpdateOne(
-		ctx,
-		bson.D{{"_id", "document"}},
-		bson.D{{"$unset", bson.D{{"foo", ""}, {"bar", ""}}}},
-	)
-	require.NoError(t, err)
-
-	var updated bson.D
-	err = collection.FindOne(ctx, bson.D{{"_id", "document"}}).Decode(&updated)
-	require.NoError(t, err)
-
-	expected = bson.D{
-		{"_id", "document"},
-	}
-	AssertEqualDocuments(t, expected, updated)
-
-	_, err = collection.UpdateOne(
-		ctx,
-		bson.D{{"_id", "document"}},
-		bson.D{{"$set", bson.D{{"foo", int32(42)}, {"bar", "baz"}}}},
-	)
-	require.NoError(t, err)
-
-	err = collection.FindOne(ctx, bson.D{{"_id", "document"}}).Decode(&updated)
-	require.NoError(t, err)
-
-	expected = bson.D{
-		{"_id", "document"},
-		{"bar", "baz"},
-		{"foo", int32(42)},
-	}
-	AssertEqualDocuments(t, expected, updated)
 }
